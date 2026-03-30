@@ -35,8 +35,8 @@ class ChangeHandler(FileSystemEventHandler):
 
 if __name__ == "__main__":
     print("="*60)
-    print(" 🛠️  MODO DESARROLLO: HOT RELOAD ACTIVADO")
-    print(" 📝  Guarda cualquier archivo (.py) para recargar la app al instante")
+    print(" [DEV] MODO DESARROLLO: HOT RELOAD ACTIVADO")
+    print(" [DEV] Guarda cualquier archivo (.py) para recargar la app al instante")
     print("="*60)
 
     # Comando para iniciar la app real

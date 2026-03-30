@@ -24,7 +24,7 @@ import customtkinter as ctk
 import theme as T
 from components import DropZone, DataTable, SAMPLE_DATA, _bind_hover, OrderCard, FloatingSearchBar
 from scanner import scan_invoice
-from orders_db import OrdersManager
+from supabase_manager import SupabaseManager
 
 CONFIG_FILE = "config.json"
 
@@ -645,25 +645,63 @@ class OrderEditDialog(ctk.CTkToplevel):
         self.ent_prov = ctk.CTkEntry(f_prov, font=T.FONT_BODY, fg_color=T.BG_APP, border_color=T.BORDER)
         self.ent_prov.pack(side="left", padx=10, fill="x", expand=True)
         self.ent_prov.insert(0, order_data['proveedor'])
+        self.ent_prov.bind("<KeyRelease>", lambda e: self._force_upper(self.ent_prov))
 
         # Items Textbox
         ctk.CTkLabel(content, text="Items (Código X Cantidad):", font=T.FONT_SMALL, text_color=T.TEXT_SECONDARY).pack(anchor="w", padx=20, pady=(15, 5))
         self.txt_items = ctk.CTkTextbox(content, font=(T.FONT_FALLBACK, 12), fg_color=T.BG_APP, border_color=T.BORDER, border_width=1)
         self.txt_items.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         
-        # Format existing items back to text: "CODE X QTY"
+        # Format existing items back to text: "[v] CODE X QTY" or "[ ] CODE X QTY"
         # Item format in storage: (id, codigo, q_pedida, q_entregada)
         items_str = ""
         for _, code, qp, qe in order_data['items']:
-            items_str += f"{code} X {int(qp)}\n"
+            prefix = "[V] " if qe >= qp else "[ ] "
+            items_str += f"{prefix}{code} X {int(qp)}\n"
         self.txt_items.insert("1.0", items_str.strip())
+
+        # Prevent merging lines (Backspace at start or Delete at end)
+        def _prevent_merge(event):
+            idx = self.txt_items.index("insert")
+            if event.keysym == "BackSpace":
+                if idx.endswith(".0"): return "break"
+            elif event.keysym == "Delete":
+                if idx == self.txt_items.index("insert lineend"): return "break"
+        
+        self.txt_items.bind("<BackSpace>", _prevent_merge)
+        self.txt_items.bind("<Delete>", _prevent_merge)
+        self.txt_items.bind("<Return>", lambda e: self.after(1, self._on_enter_smart))
 
         # Buttons
         f_btns = ctk.CTkFrame(content, fg_color="transparent")
         f_btns.pack(fill="x", side="bottom", padx=20, pady=20)
 
         ctk.CTkButton(f_btns, text="Cancelar", command=self.destroy, fg_color="transparent", border_width=1, border_color=T.BORDER, text_color=T.TEXT_PRIMARY).pack(side="right", padx=5)
+        ctk.CTkButton(f_btns, text="Tachar Todos", command=self._check_all, fg_color=T.BG_HOVER, text_color=T.TEXT_PRIMARY, border_width=1, border_color=T.BORDER).pack(side="left", padx=5)
         ctk.CTkButton(f_btns, text="Guardar Cambios", command=self._save, fg_color=T.ACCENT, hover_color=T.ACCENT_HOVER).pack(side="right")
+
+    def _force_upper(self, widget):
+        val = widget.get()
+        pos = widget.index("insert")
+        widget.delete(0, "end")
+        widget.insert(0, val.upper())
+        widget.icursor(pos)
+
+    def _on_enter_smart(self):
+        # Auto-brackets on new line if previous line had them
+        idx = self.txt_items.index("insert")
+        line_num = int(idx.split(".")[0])
+        prev_line_idx = f"{line_num - 1}.0"
+        prev_content = self.txt_items.get(prev_line_idx, f"{line_num - 1}.end").strip()
+        
+        if prev_content.startswith("["):
+            self.txt_items.insert("insert", "[ ] ")
+
+    def _check_all(self):
+        content = self.txt_items.get("1.0", "end")
+        new_content = content.replace("[ ]", "[V]")
+        self.txt_items.delete("1.0", "end")
+        self.txt_items.insert("1.0", new_content.strip())
 
     def _save(self):
         new_date = self.ent_date.get().strip()
@@ -674,27 +712,138 @@ class OrderEditDialog(ctk.CTkToplevel):
         import re
         for line in raw_items:
             if not line.strip(): continue
+            is_llegado = "[V]" in line.upper()
+            clean_line = line.replace("[v]", "").replace("[V]", "").replace("[ ]", "").strip()
+
             # Handle "CODE X QTY" or just "CODE"
-            if " X " in line.upper():
-                parts = re.split(r'\s+[xX]\s+', line, flags=re.IGNORECASE)
+            if " X " in clean_line.upper():
+                parts = re.split(r'\s+[xX]\s+', clean_line, flags=re.IGNORECASE)
                 code = parts[0].strip().upper()
                 qty = float(re.sub(r'[^\d.]', '', parts[1].split()[0]))
             else:
-                code = line.strip().upper()
+                code = clean_line.strip().upper()
                 qty = 1.0
             
-            # Find if this item already existed to preserve 'cantidad_entregada'
-            # (Simplification: if we re-parse, we might lose delivered counts unless we match codes)
-            old_delivered = 0
-            for _, o_code, o_qp, o_qe in self.order_data['items']:
-                from main import normalize_id
-                if normalize_id(o_code) == normalize_id(code):
-                    old_delivered = o_qe
-                    break
+            # De lo contrario, preservamos lo que ya estaba entregado
+            old_delivered = qty if is_llegado else 0
+            if not is_llegado:
+                for _, o_code, o_qp, o_qe in self.order_data['items']:
+                    from main import normalize_id
+                    if normalize_id(o_code) == normalize_id(code):
+                        old_delivered = o_qe
+                        break
             
             parsed_items.append((code, qty, old_delivered))
         
         self.on_save(self.order_data['id'], new_date, new_prov, parsed_items)
+        self.destroy()
+
+class ScanOverlay(ctk.CTkToplevel):
+    """Simple overlay to show scanning status."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.overrideredirect(True)
+        self.attributes("-alpha", 0.8)
+        self.configure(fg_color=T.BG_APP)
+        self.lbl = ctk.CTkLabel(self, text="Escaneando...", font=T.FONT_H2, text_color=T.TEXT_PRIMARY)
+        self.lbl.pack(expand=True, padx=40, pady=40)
+        
+        # Center on parent
+        self.update_idletasks()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        w, h = self.winfo_width(), self.winfo_height()
+        self.geometry(f"{w}x{h}+{px+(pw-w)//2}+{py+(ph-h)//2}")
+        
+    def set_status(self, text):
+        self.lbl.configure(text=text)
+        
+    def hide(self):
+        self.destroy()
+
+class ReviewImportDialog(ctk.CTkToplevel):
+    """Dialog to review and edit orders extracted from a PDF/Image before final import."""
+    def __init__(self, parent, orders_data, on_confirm):
+        super().__init__(parent)
+        self.title("Revisar Importación")
+        self.transient(parent)
+        self.configure(fg_color=T.BG_APP)
+        self.orders = orders_data
+        self.on_confirm = on_confirm
+
+        # Center
+        self.update_idletasks()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        w, h = 600, 700
+        x = px + (pw - w) // 2
+        y = py + (ph - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        # Main Layout
+        self.container = ctk.CTkFrame(self, fg_color=T.BG_CARD, corner_radius=T.RADIUS_LG, border_width=1, border_color=T.BORDER)
+        self.container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(self.container, text="Revisar Pedidos Detectados", font=T.FONT_H2, text_color=T.TEXT_PRIMARY).pack(pady=(20, 10))
+        ctk.CTkLabel(self.container, text="Verifica la fecha y el proveedor antes de confirmar.", font=T.FONT_SMALL, text_color=T.TEXT_TERTIARY).pack()
+
+        # Scrollable area for orders
+        self.scroll = ctk.CTkScrollableFrame(self.container, fg_color="transparent")
+        self.scroll.pack(fill="both", expand=True, padx=10, pady=15)
+
+        self.order_rows = []
+        for i, order in enumerate(self.orders):
+            self._add_order_row(order, i)
+
+        # Footer
+        f_btns = ctk.CTkFrame(self.container, fg_color="transparent")
+        f_btns.pack(fill="x", side="bottom", padx=20, pady=20)
+
+        ctk.CTkButton(f_btns, text="Cancelar", command=self.destroy, fg_color="transparent", border_width=1, border_color=T.BORDER, text_color=T.TEXT_PRIMARY).pack(side="right", padx=5)
+        ctk.CTkButton(f_btns, text="Confirmar e Importar", command=self._confirm, fg_color=T.ACCENT, hover_color=T.ACCENT_HOVER).pack(side="right")
+
+    def _add_order_row(self, order, idx):
+        row = ctk.CTkFrame(self.scroll, fg_color=T.BG_APP, corner_radius=T.RADIUS_MD, border_width=1, border_color=T.BORDER)
+        row.pack(fill="x", pady=5, padx=5)
+
+        # Inputs
+        f_inputs = ctk.CTkFrame(row, fg_color="transparent")
+        f_inputs.pack(fill="x", padx=10, pady=10)
+
+        ctk.CTkLabel(f_inputs, text="Fec:", font=T.FONT_SMALL).pack(side="left")
+        ent_date = ctk.CTkEntry(f_inputs, font=T.FONT_BODY, width=100)
+        ent_date.pack(side="left", padx=5)
+        ent_date.insert(0, order.get('fecha', ''))
+
+        ctk.CTkLabel(f_inputs, text="Prov:", font=T.FONT_SMALL).pack(side="left", padx=(10, 0))
+        ent_prov = ctk.CTkEntry(f_inputs, font=T.FONT_BODY)
+        ent_prov.pack(side="left", padx=5, fill="x", expand=True)
+        ent_prov.insert(0, order.get('proveedor', ''))
+        ent_prov.bind("<KeyRelease>", lambda e, w=ent_prov: self._force_upper(w))
+
+        # Items Preview (Summary)
+        items = order.get('articulos', [])
+        summary = f"{len(items)} artículos detectados"
+        ctk.CTkLabel(row, text=summary, font=T.FONT_MICRO, text_color=T.TEXT_TERTIARY).pack(anchor="w", padx=15, pady=(0, 10))
+
+        self.order_rows.append({'date_ent': ent_date, 'prov_ent': ent_prov, 'articulos': items})
+
+    def _force_upper(self, widget):
+        val = widget.get()
+        pos = widget.index("insert")
+        widget.delete(0, "end")
+        widget.insert(0, val.upper())
+        widget.icursor(pos)
+
+    def _confirm(self):
+        final_orders = []
+        for row in self.order_rows:
+            final_orders.append({
+                'fecha': row['date_ent'].get(),
+                'proveedor': row['prov_ent'].get().upper(),
+                'articulos': row['articulos']
+            })
+        self.on_confirm(final_orders)
         self.destroy()
 
 class OrdersView(ctk.CTkFrame):
@@ -722,13 +871,42 @@ class OrdersView(ctk.CTkFrame):
         entry_card.grid(row=0, column=0, sticky="nsew", padx=(0, 15))
         
         ctk.CTkLabel(entry_card, text="Cargar Nueva Nota", font=T.FONT_H3, text_color=T.TEXT_PRIMARY).pack(padx=20, pady=(20, 5), anchor="w")
-        ctk.CTkLabel(entry_card, text="Pega el texto del pedido aquí:", font=T.FONT_SMALL, text_color=T.TEXT_TERTIARY).pack(padx=20, anchor="w")
+
+        # ── Proveedor + Fecha row ──────────────
+        f_meta = ctk.CTkFrame(entry_card, fg_color="transparent")
+        f_meta.pack(fill="x", padx=20, pady=(0, 5))
+        f_meta.grid_columnconfigure(0, weight=1)
+        f_meta.grid_columnconfigure(1, weight=0)
+
+        prov_frame = ctk.CTkFrame(f_meta, fg_color="transparent")
+        prov_frame.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ctk.CTkLabel(prov_frame, text="Proveedor", font=T.FONT_MICRO, text_color=T.TEXT_TERTIARY).pack(anchor="w")
+        self.ent_prov = ctk.CTkEntry(prov_frame, font=T.FONT_BODY, fg_color=T.BG_APP, border_color=T.BORDER, placeholder_text="Ej: DM")
+        self.ent_prov.pack(fill="x")
+        self.ent_prov.bind("<KeyRelease>", lambda e: self._force_upper(self.ent_prov))
+
+        fecha_frame = ctk.CTkFrame(f_meta, fg_color="transparent")
+        fecha_frame.grid(row=0, column=1, sticky="e")
+        ctk.CTkLabel(fecha_frame, text="Fecha", font=T.FONT_MICRO, text_color=T.TEXT_TERTIARY).pack(anchor="w")
+        self.ent_date = ctk.CTkEntry(fecha_frame, font=T.FONT_BODY, fg_color=T.BG_APP, border_color=T.BORDER, width=110)
+        self.ent_date.pack()
+        from datetime import date as _date
+        self.ent_date.insert(0, _date.today().strftime("%d/%m/%Y"))
+
+        ctk.CTkLabel(entry_card, text="Artículos (Código X Cantidad):", font=T.FONT_SMALL, text_color=T.TEXT_TERTIARY).pack(padx=20, anchor="w")
         
         self.text_input = ctk.CTkTextbox(entry_card, font=(T.FONT_FALLBACK, 12), fg_color=T.BG_APP, border_width=1, border_color=T.BORDER)
         self.text_input.pack(fill="both", expand=True, padx=20, pady=10)
+        self.text_input.bind("<Return>", lambda e: self.after(1, self._on_enter_smart))
         
-        btn_parse = ctk.CTkButton(entry_card, text="Procesar Nota", font=T.FONT_BTN, fg_color=T.ACCENT, hover_color=T.ACCENT_HOVER, command=self._on_parse)
-        btn_parse.pack(fill="x", padx=20, pady=(0, 20))
+        f_actions = ctk.CTkFrame(entry_card, fg_color="transparent")
+        f_actions.pack(fill="x", padx=20, pady=(0, 20))
+
+        btn_parse = ctk.CTkButton(f_actions, text="Procesar Nota", font=T.FONT_BTN, fg_color=T.ACCENT, hover_color=T.ACCENT_HOVER, command=self._on_parse)
+        btn_parse.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        btn_import = ctk.CTkButton(f_actions, text="Importar PDF", font=T.FONT_BTN, fg_color=T.BG_APP, hover_color=T.BG_HOVER, text_color=T.TEXT_PRIMARY, border_width=1, border_color=T.BORDER, command=self._on_import_pdf)
+        btn_import.pack(side="left", fill="x", expand=True)
 
         # ── Right: Orders Scroll ────────────────
         self.scroll = ctk.CTkScrollableFrame(content, fg_color="transparent", corner_radius=0)
@@ -777,8 +955,11 @@ class OrdersView(ctk.CTkFrame):
         for i, card in enumerate(self._all_cards):
             d = card.order_data
             match = (t in d['proveedor'].upper() or 
+                     t in d.get('repuesto', '').upper() or
                      t in d['fecha'].upper() or
                      any(t in str(item[1]).upper() for item in d['items']))
+            
+            card.highlight_matches(text) # Visual Highlight inside card
             
             if match:
                 card.pack(fill="x", pady=(0, 15))
@@ -816,23 +997,81 @@ class OrdersView(ctk.CTkFrame):
             self.db.delete_order(order_id)
             self.refresh_list()
 
+    def _force_upper(self, widget):
+        val = widget.get()
+        pos = widget.index("insert")
+        widget.delete(0, "end")
+        widget.insert(0, val.upper())
+        widget.icursor(pos)
+
+    def _on_enter_smart(self):
+        # Auto-brackets on new line if previous line had them
+        idx = self.text_input.index("insert")
+        line_num = int(idx.split(".")[0])
+        prev_line_idx = f"{line_num - 1}.0"
+        prev_content = self.text_input.get(prev_line_idx, f"{line_num - 1}.end").strip()
+        
+        if prev_content.startswith("["):
+            self.text_input.insert("insert", "[ ] ")
+            self.text_input.see("end")
+
     def _on_parse(self):
         raw_text = self.text_input.get("1.0", "end").strip()
         if not raw_text: return
         
+        # Read manual override fields
+        manual_prov = self.ent_prov.get().strip().upper()
+        manual_date = self.ent_date.get().strip()
+        from datetime import date as _date
+        if not manual_date:
+            manual_date = _date.today().strftime("%d/%m/%Y")
+        
         try:
             import re
             lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
-            
-            # State for the parser
-            current_date = "S/F"
+            item_pattern = r'(.+?)\s+[xX]\s+([\d.]+)'
+
+            # If provider is manually set -> create a single order with all items
+            if manual_prov:
+                items = []
+                for line in lines:
+                    is_llegado = "[V]" in line.upper()
+                    clean_line = line.replace("[v]", "").replace("[V]", "").replace("[ ]", "").strip()
+                    
+                    m = re.search(item_pattern, clean_line, re.IGNORECASE)
+                    if m:
+                        code = m.group(1).strip().upper()
+                        count = float(m.group(2))
+                    else:
+                        code = clean_line.strip().upper()
+                        count = 1.0
+                    
+                    # Delivered count logic
+                    qe = count if is_llegado else 0
+                    # DM formatter
+                    c_clean = code.replace("/", "")
+                    if manual_prov == "DM" and len(c_clean) == 8 and c_clean.isdigit():
+                        code = f"{c_clean[:2]}/{c_clean[2:5]}/{c_clean[5:]}"
+                    items.append((code, count, qe))
+                
+                if not items:
+                    raise ValueError("No se encontraron artículos en el texto.")
+                
+                self.db.add_order(manual_date, manual_prov, items)
+                self.text_input.delete("1.0", "end")
+                self.ent_prov.delete(0, "end")
+                # Reset date to today
+                self.ent_date.delete(0, "end")
+                self.ent_date.insert(0, _date.today().strftime("%d/%m/%Y"))
+                self.refresh_list()
+                return
+
+            # No manual provider => use smart text parsing (multi-order support)
+            current_date = manual_date
             current_provider = "ORIGINAL"
             current_items = []
-            
-            # Regex patterns
             date_pattern = r'^\d{1,2}/\d{1,2}/\d{2,4}$'
             pedido_pattern = r'Pedido\s+["\']?([^"\']+)["\']?'
-            item_pattern = r'(.+?)\s+X\s+(\d+)(.*)'
 
             def save_current_order():
                 if current_items:
@@ -842,45 +1081,37 @@ class OrdersView(ctk.CTkFrame):
 
             processed_any = False
             for line in lines:
-                # Check for Date
                 if re.match(date_pattern, line):
-                    # Save previous order if switching dates
                     if save_current_order():
                         processed_any = True
                     current_date = line
                     current_items = []
                     current_provider = "ORIGINAL"
-                
-                # Check for Provider (Manual Header)
                 elif re.search(pedido_pattern, line, re.IGNORECASE):
                     if current_items:
                         if save_current_order():
                             processed_any = True
                         current_items = []
-                    
                     prov_match = re.search(pedido_pattern, line, re.IGNORECASE)
                     current_provider = prov_match.group(1).strip().upper()
-                
-                # Catch-all for items (naked codes or with X)
-                else: 
-                    item_match = re.search(item_pattern, line, re.IGNORECASE)
-                    if item_match:
-                        code = item_match.group(1).strip().upper()
-                        count = float(item_match.group(2))
+                else:
+                    is_llegado = "[V]" in line.upper()
+                    clean_line = line.replace("[v]", "").replace("[V]", "").replace("[ ]", "").strip()
+
+                    m = re.search(item_pattern, clean_line, re.IGNORECASE)
+                    if m:
+                        code = m.group(1).strip().upper()
+                        count = float(m.group(2))
                     else:
-                        # Naked code: default to 1 piece
-                        code = line.strip().upper()
+                        code = clean_line.strip().upper()
                         count = 1.0
                     
-                    # Formateador especial para DM: 04115010 -> 04/115/010
-                    # Lo hacemos sobre el código limpio (sin barras) para que sea consistente
+                    qe = count if is_llegado else 0
                     c_clean = code.replace("/", "")
                     if current_provider == "DM" and len(c_clean) == 8 and c_clean.isdigit():
                         code = f"{c_clean[:2]}/{c_clean[2:5]}/{c_clean[5:]}"
-                    
-                    current_items.append((code, count))
+                    current_items.append((code, count, qe))
             
-            # Save final block
             if save_current_order():
                 processed_any = True
             
@@ -893,6 +1124,93 @@ class OrdersView(ctk.CTkFrame):
         except Exception as e:
             from tkinter import messagebox
             messagebox.showerror("Error de Formato", f"No se pudo procesar la nota.\nDetalle: {e}")
+
+    def _on_import_pdf(self):
+        config = get_persisted_config()
+        api_key = config.get("GEMINI_API_KEY")
+        if not api_key:
+            from tkinter import messagebox
+            messagebox.showwarning("Configuración", "Por favor, configura tu API Key de Gemini primero.")
+            return
+
+        path = filedialog.askopenfilename(
+            title="Seleccionar documento de pedido",
+            filetypes=[("Documentos", "*.pdf *.png *.jpg *.jpeg *.tiff *.bmp")]
+        )
+        if not path: return
+
+        def run_inference():
+            try:
+                # Show overlay
+                self.overlay = ScanOverlay(self.winfo_toplevel())
+                self.overlay.set_status("Analizando documento...")
+                
+                def update_status(msg):
+                    self.after(0, lambda: self.overlay.set_status(msg) if hasattr(self, 'overlay') else None)
+                
+                # Import scanner
+                from scanner import scan_invoice
+                data = scan_invoice(path, api_key, status_callback=update_status)
+                print(f"[DEBUG] Respuesta de la IA: tipo={data.get('tipo')}, pedidos={len(data.get('pedidos_data', []))}")
+                
+                self.after(0, lambda: self._handle_scan_result(data))
+            except Exception as e:
+                import traceback
+                print(f"[ERROR] Importacion fallida: {traceback.format_exc()}")
+                err_msg = str(e)
+                self.after(0, lambda: self.overlay.hide())
+                from tkinter import messagebox
+                self.after(0, lambda: messagebox.showerror("Error", f"Error procesando el documento:\n{err_msg}"))
+
+        threading.Thread(target=run_inference, daemon=True).start()
+
+    def _handle_scan_result(self, data):
+        self.overlay.hide()
+        self.update()
+        
+        doc_type = data.get('tipo', 'FACTURA')
+        print(f"[DEBUG] Tipo detectado: {doc_type}")
+        
+        if doc_type == 'LISTA_PEDIDOS':
+            pedidos_data = data.get('pedidos_data', [])
+            print(f"[DEBUG] Pedidos encontrados: {len(pedidos_data)}")
+            if not pedidos_data:
+                from tkinter import messagebox
+                messagebox.showinfo("Scanner", "No se detectaron pedidos en el documento.")
+                return
+            
+            # Show Review Modal
+            dlg = ReviewImportDialog(self.winfo_toplevel(), pedidos_data, on_confirm=self._confirm_import)
+            dlg.lift()
+            dlg.focus_force()
+        else:
+            # Show what the AI detected so user understands
+            from tkinter import messagebox
+            enc = data.get('factura_data', {}).get('encabezado', [])
+            prov = next((e['valor'] for e in enc if 'proveedor' in e.get('campo','').lower()), '-')
+            arts = data.get('factura_data', {}).get('articulos', [])
+            messagebox.showinfo(
+                "Documento detectado",
+                f"Tipo: {doc_type}\nProveedor: {prov}\nArtículos: {len(arts)}\n\nEste documento es una Factura/Remito. Usá el escáner principal para procesarlo."
+            )
+
+    def _confirm_import(self, final_orders):
+        count = 0
+        for order in final_orders:
+            items = []
+            for art in order['articulos']:
+                code = art.get('codigo', '-')
+                qp = float(art.get('cantidad', 1) or 1)
+                qe = qp if art.get('llegado', False) else 0
+                items.append((code, qp, qe))
+            
+            if items:
+                self.db.add_order(order['fecha'], order['proveedor'], items)
+                count += 1
+        
+        self.refresh_list()
+        from tkinter import messagebox
+        messagebox.showinfo("Importación", f"Se han importado {count} pedidos exitosamente.")
 
 class IngresoView(ctk.CTkFrame):
     def __init__(self, parent, get_api_key_callback, db_manager: OrdersManager = None, **kw):
@@ -933,8 +1251,12 @@ class IngresoView(ctk.CTkFrame):
         self._load_initial_data()
 
     def _load_initial_data(self):
-        # Cargar historial persistido
-        data = load_history()
+        # Cargar historial (Supabase o local fallback)
+        if self.db and self.db.client:
+            hist, items, totals = self.db.get_history()
+            data = {"history": hist, "items": items, "totals": totals}
+        else:
+            data = load_history()
         # Migration: handle different row formats
         raw_history = data.get("history", [])
         temp_history = []
@@ -1051,6 +1373,11 @@ class IngresoView(ctk.CTkFrame):
         self.invoice_totals_dict.pop(nro, None)
         
         # 3. Persistir
+        if self.db and self.db.client:
+            # Supabase delete not currently implemented for history individually, but
+            # realistically deleting history should also be synced eventually.
+            pass
+        
         save_history(self.invoice_history, self.invoice_items_dict, self.invoice_totals_dict)
         
         # 4. Refresh UI
@@ -1171,6 +1498,10 @@ class IngresoView(ctk.CTkFrame):
         self.invoice_items_dict[nro] = results_items
         self.invoice_totals_dict[nro] = {"subtotal": subtot, "total": total_val}
         
+        if self.db and self.db.client:
+            import json
+            self.db.save_history_record((prov, nro, fec, monto, estado, is_remito, link_id), json.dumps(results_items), json.dumps({"subtotal": subtot, "total": total_val}))
+            
         save_history(self.invoice_history, self.invoice_items_dict, self.invoice_totals_dict)
         self.bottom_table.load_results(self.invoice_history)
 
@@ -1217,15 +1548,32 @@ class ConfiguracionView(ctk.CTkFrame):
         ctk.CTkLabel(card, text="Se requiere una valid token para usar la inteligencia artificial extrayendo facturas.", font=T.FONT_SMALL, text_color=T.TEXT_SECONDARY).pack(anchor="w", padx=20)
         
         self.api_entry = ctk.CTkEntry(card, width=400, font=T.FONT_BODY, fg_color=T.BG_APP, border_color=T.BORDER, show="*")
-        self.api_entry.pack(anchor="w", padx=20, pady=(10, 20))
+        self.api_entry.pack(anchor="w", padx=20, pady=(10, 10))
+        
+        ctk.CTkLabel(card, text="Supabase URL", font=T.FONT_H3, text_color=T.TEXT_PRIMARY).pack(anchor="w", padx=20, pady=(10, 5))
+        self.supa_url_entry = ctk.CTkEntry(card, width=400, font=T.FONT_BODY, fg_color=T.BG_APP, border_color=T.BORDER)
+        self.supa_url_entry.pack(anchor="w", padx=20, pady=(0, 10))
+
+        ctk.CTkLabel(card, text="Supabase Key", font=T.FONT_H3, text_color=T.TEXT_PRIMARY).pack(anchor="w", padx=20, pady=(10, 5))
+        self.supa_key_entry = ctk.CTkEntry(card, width=400, font=T.FONT_BODY, fg_color=T.BG_APP, border_color=T.BORDER, show="*")
+        self.supa_key_entry.pack(anchor="w", padx=20, pady=(0, 20))
         
         # Cargar si existe (de mem o config file)
         config_data = get_persisted_config()
         key = os.environ.get("GEMINI_API_KEY") or config_data.get("GEMINI_API_KEY", "")
         if key:
             self.api_entry.insert(0, key)
-            # Asegurar que esté en environ por si otras partes lo leen
             os.environ["GEMINI_API_KEY"] = key
+            
+        supa_url = os.environ.get("SUPABASE_URL") or config_data.get("SUPABASE_URL", "")
+        if supa_url:
+            self.supa_url_entry.insert(0, supa_url)
+            os.environ["SUPABASE_URL"] = supa_url
+
+        supa_key = os.environ.get("SUPABASE_KEY") or config_data.get("SUPABASE_KEY", "")
+        if supa_key:
+            self.supa_key_entry.insert(0, supa_key)
+            os.environ["SUPABASE_KEY"] = supa_key
             
         save_btn = ctk.CTkButton(card, text="Guardar Cambios", font=T.FONT_BTN, fg_color=T.ACCENT, hover_color=T.ACCENT_HOVER, command=self._save_config)
         save_btn.pack(anchor="w", padx=20, pady=(0, 20))
@@ -1245,9 +1593,17 @@ class ConfiguracionView(ctk.CTkFrame):
         val = self.api_entry.get().strip()
         os.environ["GEMINI_API_KEY"] = val
         
+        url_val = self.supa_url_entry.get().strip()
+        os.environ["SUPABASE_URL"] = url_val
+        
+        key_val = self.supa_key_entry.get().strip()
+        os.environ["SUPABASE_KEY"] = key_val
+        
         # Persistir en disco
         cfg = get_persisted_config()
         cfg["GEMINI_API_KEY"] = val
+        cfg["SUPABASE_URL"] = url_val
+        cfg["SUPABASE_KEY"] = key_val
         save_persisted_config(cfg)
 
     def _toggle_theme(self):
@@ -1298,7 +1654,11 @@ class App(ctk.CTk):
         self.content_container.grid_columnconfigure(0, weight=1)
 
         # DB Manager init
-        self.orders_db = OrdersManager()
+        # Ensure credentials are in env before instantiating SupabaseManager
+        cfg = get_persisted_config()
+        if "SUPABASE_URL" in cfg: os.environ["SUPABASE_URL"] = cfg["SUPABASE_URL"]
+        if "SUPABASE_KEY" in cfg: os.environ["SUPABASE_KEY"] = cfg["SUPABASE_KEY"]
+        self.orders_db = SupabaseManager()
 
         # Instantiate Views
         self.views = {

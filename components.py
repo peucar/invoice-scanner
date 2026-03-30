@@ -13,10 +13,6 @@ from PIL import Image, ImageTk
 import theme as T
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _rounded_shadow_frame(parent, **kw):
     """Convenience: a CTkFrame styled as a floating card."""
     return ctk.CTkFrame(
@@ -27,6 +23,13 @@ def _rounded_shadow_frame(parent, **kw):
         border_width=1,
         **kw,
     )
+
+def format_article_code(code, provider):
+    if not code: return ""
+    is_dm = provider.lower().strip() == "dm" if provider else False
+    if is_dm and len(code) == 8 and code.isdigit():
+        return f"{code[:2]}/{code[2:5]}/{code[5:]}"
+    return code
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -559,29 +562,65 @@ class OrderCard(ctk.CTkFrame):
         self.order_data = order_data
         self.on_delete = on_delete
         self.on_edit = on_edit
+        self.expanded = False
+        self._item_labels = [] 
+        self.configure(cursor="hand2")
         self._build()
+        self._bind_events()
+
+    def _bind_events(self):
+        # Hover effect on the whole card
+        def on_enter(e): self.configure(border_color=T.ACCENT)
+        def on_leave(e): self.configure(border_color=T.BORDER)
+        self.bind("<Enter>", on_enter, add="+")
+        self.bind("<Leave>", on_leave, add="+")
+
+    def _toggle_expand(self, event=None):
+        self.expanded = not self.expanded
+        if self.expanded:
+            self._body.pack(fill="x", before=None)
+            self._chevron.configure(text="▼")
+        else:
+            self._body.pack_forget()
+            self._chevron.configure(text="▶")
 
     def _build(self):
-        # Header: Date and Provider
-        hdr = ctk.CTkFrame(self, fg_color="transparent")
-        hdr.pack(fill="x", padx=15, pady=(15, 10))
+        # ── Header: Summary Row ────────────────
+        self._hdr = ctk.CTkFrame(self, fg_color="transparent")
+        self._hdr.pack(fill="x", padx=15, pady=10)
+        self._hdr.bind("<Button-1>", self._toggle_expand)
         
+        # Chevron icon
+        self._chevron = ctk.CTkLabel(self._hdr, text="▶", font=(T.FONT_FALLBACK, 10), text_color=T.TEXT_TERTIARY)
+        self._chevron.pack(side="left", padx=(0, 10))
+        self._chevron.bind("<Button-1>", self._toggle_expand)
+
         lbl_title = ctk.CTkLabel(
-            hdr, 
+            self._hdr, 
             text=f"{self.order_data['fecha']} — {self.order_data['proveedor']}", 
             font=T.FONT_H3, 
             text_color=T.TEXT_PRIMARY
         )
         lbl_title.pack(side="left")
+        lbl_title.bind("<Button-1>", self._toggle_expand)
         
         # State Badge
         state = self.order_data['estado']
         status_map = {"Pendiente": "warning", "Parcial": "neutral", "Completado": "success"}
-        badge = StatusBadge(hdr, text=state, status=status_map.get(state, "neutral"))
+        badge = StatusBadge(self._hdr, text=state, status=status_map.get(state, "neutral"))
         badge.pack(side="left", padx=10)
+        badge.bind("<Button-1>", self._toggle_expand)
+        for child in badge.winfo_children():
+            child.bind("<Button-1>", self._toggle_expand)
 
-        # Actions (Delete / Edit)
-        actions = ctk.CTkFrame(hdr, fg_color="transparent")
+        # Item Count Summary (Mini-tab style)
+        item_count = len(self.order_data['items'])
+        lbl_count = ctk.CTkLabel(self._hdr, text=f"({item_count} art.)", font=T.FONT_MICRO, text_color=T.TEXT_TERTIARY)
+        lbl_count.pack(side="left", padx=5)
+        lbl_count.bind("<Button-1>", self._toggle_expand)
+
+        # Actions (Delete / Edit) - Always visible in header
+        actions = ctk.CTkFrame(self._hdr, fg_color="transparent")
         actions.pack(side="right")
 
         if self.on_delete:
@@ -602,22 +641,25 @@ class OrderCard(ctk.CTkFrame):
             )
             btn_edit.pack(side="right", padx=5)
 
-        # Separator
-        ctk.CTkFrame(self, height=1, fg_color=T.BORDER).pack(fill="x", padx=15)
+        # ── Body: Detailed List (Collapsible) ──
+        self._body = ctk.CTkFrame(self, fg_color="transparent")
+        # Do NOT pack yet (starts collapsed)
 
-        # Items List
-        items_frame = ctk.CTkFrame(self, fg_color="transparent")
-        items_frame.pack(fill="x", padx=20, pady=(10, 15))
+        # Separator inside body
+        ctk.CTkFrame(self._body, height=1, fg_color=T.BORDER).pack(fill="x", padx=15)
+
+        items_container = ctk.CTkFrame(self._body, fg_color="transparent")
+        items_container.pack(fill="x", padx=20, pady=(10, 15))
 
         for i, item in enumerate(self.order_data['items']):
             # item = (id, codigo, q_pedida, q_entregada)
             _, code, qp, qe = item
+            code = str(code).upper()
             is_done = qe >= qp
             
-            row = ctk.CTkFrame(items_frame, fg_color="transparent")
+            row = ctk.CTkFrame(items_container, fg_color="transparent")
             row.pack(fill="x", pady=2)
             
-            # Checkbox (disabled, just for visual)
             cb = ctk.CTkCheckBox(
                 row, text="", width=20, height=20, 
                 checkbox_width=18, checkbox_height=18,
@@ -627,8 +669,8 @@ class OrderCard(ctk.CTkFrame):
             if is_done: cb.select()
             cb.pack(side="left")
             
-            # Text
-            display_text = f"{code}  ( {int(qe)} / {int(qp)} )"
+            formatted_code = format_article_code(code, self.order_data.get('proveedor'))
+            display_text = f"{formatted_code}  ( {int(qe)} / {int(qp)} )"
             font = (T.FONT_FALLBACK, 13)
             color = T.TEXT_SECONDARY
             
@@ -638,6 +680,31 @@ class OrderCard(ctk.CTkFrame):
                 
             lbl = ctk.CTkLabel(row, text=display_text, font=font, text_color=color)
             lbl.pack(side="left", padx=5)
+            self._item_labels.append((lbl, code, is_done))
+            # Bind children to parent's edit
+            if self.on_edit:
+                lbl.bind("<Button-1>", lambda e: self.on_edit(self.order_data))
+                row.bind("<Button-1>", lambda e: self.on_edit(self.order_data))
+                cb.bind("<Button-1>", lambda e: self.on_edit(self.order_data))
+
+    def highlight_matches(self, text):
+        """Highligts items that match the search text in yellow."""
+        if not text:
+            # Reset all
+            for lbl, code, is_done in self._item_labels:
+                color = T.TEXT_TERTIARY if is_done else T.TEXT_SECONDARY
+                lbl.configure(fg_color="transparent", text_color=color)
+            return
+
+        t = text.upper()
+        for lbl, code, is_done in self._item_labels:
+            if t in code.upper() or t in self.order_data['proveedor'].upper():
+                # Highlight in yellow
+                lbl.configure(fg_color="#FFF176", text_color="#000000")
+            else:
+                # Reset
+                color = T.TEXT_TERTIARY if is_done else T.TEXT_SECONDARY
+                lbl.configure(fg_color="transparent", text_color=color)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FloatingSearchBar

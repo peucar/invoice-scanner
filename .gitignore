@@ -19,3 +19,13 @@ startup_log_unbuffered.txt
 *.jpeg
 *.tiff
 *.bmp
+
+# Mobile App
+mobile-app/node_modules/
+mobile-app/.next/
+mobile-app/out/
+mobile-app/build/
+.env.local
+.env.*.local
+
+*.log

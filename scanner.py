@@ -1,109 +1,117 @@
 import os
 import json
+import base64
 import time
-from typing import List, Tuple
-from google import genai
-from google.genai import types
+import mimetypes
+import requests
+from typing import Dict, Any
 
-from typing import List, Tuple, Dict, Any
+GEMINI_MODEL = "gemini-2.0-flash"
+MAX_RETRIES = 3
 
-def scan_invoice(filepath: str, api_key: str) -> Tuple[List[Tuple[str, str, str, str]], List[Tuple[str, str, str, str]]]:
+def scan_invoice(filepath: str, api_key: str, status_callback=None) -> Dict[str, Any]:
     """
-    Envía la imagen o PDF a Gemini para extraer los datos de la factura.
-    Devuelve: (resultados_encabezado, resultados_articulos)
-    - resultados_encabezado: lista de tuplas (Campo, Valor, Confianza, estado)
-    - resultados_articulos: lista de tuplas (codigo, descripcion, cantidad, importe)
+    Sends a file to Gemini to extract data.
+    Supports Facturas, Remitos and Notepad Lists.
+    Returns a dict with the full AI JSON structure.
+    Uses the REST API with inline base64 data for reliability.
+    Retries automatically on rate limit (429) errors.
     """
     if not api_key:
         raise ValueError("API Key de Gemini no proporcionada.")
 
-    client = genai.Client(api_key=api_key)
-    
+    def _status(msg):
+        print(f"[SCANNER] {msg}")
+        if status_callback:
+            status_callback(msg)
+
     prompt = (
-        "Eres un sistema experto en extraer datos de facturas (preferiblemente de países hispanohablantes).\n"
-        "Necesito que extraigas DOS conjuntos de datos de este documento:\n\n"
-        "1. ENCABEZADO: Extrae los siguientes campos generales:\n"
-        "- Proveedor\n"
-        "- NIF / RFC / CUIT\n"
-        "- Número de factura (o de Remito si el documento es un Remito)\n"
-        "- Fecha de emisión (DD/MM/YYYY)\n"
-        "- Subtotal\n"
-        "- Total\n"
-        "- Tipo de Documento (DEBE ser 'Factura' o 'Remito')\n"
-        "- Remito Vinculado (SOLO para Facturas: Busca en la columna 'REMITO' de la tabla de artículos. Ej: 'Rem-A-0013-00089890'. Extrae solo el número 0013-00089890 si es posible)\n\n"
-        "2. ARTICULOS: Extrae cada línea de artículo o servicio facturado.\n\n"
-        "Responde ESTRICTAMENTE con un solo objeto JSON sin formato markdown extra (` ```json ` no). "
-        "El JSON debe tener exactamente esta estructura:\n"
+        "Eres un sistema experto en extraer datos de documentos comerciales.\n"
+        "Este documento puede ser una Factura/Remito oficial O una Lista de Pedidos (por ejemplo, exportada de un bloc de notas).\n\n"
+        "Analiza el documento y determina su tipo: 'FACTURA', 'REMITO' o 'LISTA_PEDIDOS'.\n\n"
+        "1. Si es 'FACTURA' o 'REMITO':\n"
+        "   - Extrae el ENCABEZADO (Proveedor, NIF/CUIT, Número, Fecha DD/MM/YYYY, Subtotal, Total, Tipo).\n"
+        "   - Extrae los ARTICULOS (codigo, descripcion, cantidad, importe).\n"
+        "   - Busca 'Remito Vinculado' para facturas.\n\n"
+        "2. Si es 'LISTA_PEDIDOS' (formato bloc de notas):\n"
+        "   - Extrae los PEDIDOS. Un documento puede tener varios bloques (ej: 'Pedido Original').\n"
+        "   - Formato: 'CÓDIGO X CANTIDAD' (ej: 1103P8 X 1).\n"
+        "   - 'llegado': true si el ítem tiene un checkmark (v) O si el texto está tachado (strikethrough).\n"
+        "   - 'fecha': busca una fecha en el encabezado (ej: 21/10/25).\n"
+        "   - 'proveedor': usa los encabezados de bloque.\n\n"
+        "Responde ESTRICTAMENTE con un solo objeto JSON sin formato markdown extra.\n"
+        "Estructura:\n"
         "{\n"
-        '  "encabezado": [\n'
-        '    {"campo": "Proveedor", "valor": "Acme S.A.", "confianza": "98 %", "estado": "success"}\n'
-        '  ],\n'
-        '  "articulos": [\n'
-        '    {"codigo": "001", "descripcion": "Servicio X", "cantidad": "2", "importe": "1500.00"}\n'
-        '  ]\n'
+        '  "tipo": "FACTURA" | "REMITO" | "LISTA_PEDIDOS",\n'
+        '  "factura_data": {\n'
+        '    "encabezado": [ {"campo": "Proveedor", "valor": "...", "confianza": "...", "estado": "..."} ],\n'
+        '    "articulos": [ {"codigo": "...", "descripcion": "...", "cantidad": "...", "importe": "..."} ]\n'
+        "  },\n"
+        '  "pedidos_data": [\n'
+        '    { "proveedor": "...", "fecha": "DD/MM/YYYY", "articulos": [ {"codigo": "...", "cantidad": "...", "llegado": true} ] }\n'
+        "  ]\n"
         "}\n"
-        "Para el encabezado, 'estado' solo puede ser 'success', 'warning' o 'error'. "
-        "Si no encuentras el valor en el encabezado, pon valor vacío ('') y estado 'error'."
     )
 
-    uploaded_file = None
-    try:
-        # 1. Subir archivo a la API de Files (soporta PDF nativo, PNG, JPG, etc.)
-        uploaded_file = client.files.upload(file=filepath)
-        
-        # 2. Esperar procesamiento (necesario en PDFs por ejemplo)
-        while uploaded_file.state.name == "PROCESSING":
-            time.sleep(1)
-            uploaded_file = client.files.get(name=uploaded_file.name)
-            
-        if uploaded_file.state.name == "FAILED":
-             raise RuntimeError("Fallo procesando el documento en la API de Gemini.")
+    # Read file and encode to base64
+    mime_type, _ = mimetypes.guess_type(filepath)
+    if not mime_type:
+        ext = os.path.splitext(filepath)[1].lower()
+        mime_map = {'.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg'}
+        mime_type = mime_map.get(ext, 'application/octet-stream')
 
-        # 3. Pedir la inferencia usando gemini-2.5-flash
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[uploaded_file, prompt]
-        )
-        
-        # 4. Parsear respuesta (limpieza de posibles backticks de markdown)
-        raw_text = response.text.strip()
-        if raw_text.startswith("```json"):
-            raw_text = raw_text[7:]
-        elif raw_text.startswith("```"):
-            raw_text = raw_text[3:]
-        if raw_text.endswith("```"):
-            raw_text = raw_text[:-3]
-            
-        data = json.loads(raw_text.strip())
-        
-        # Parse header
-        header_data = data.get("encabezado", [])
-        header_results = []
-        for item in header_data:
-            header_results.append((
-                item.get("campo", "Desconocido"),
-                str(item.get("valor", "")),
-                str(item.get("confianza", "0 %")),
-                item.get("estado", "error")
-            ))
-            
-        # Parse items
-        items_data = data.get("articulos", [])
-        items_results = []
-        for i in items_data:
-            items_results.append((
-                str(i.get("codigo", "-")),
-                str(i.get("descripcion", "-")),
-                str(i.get("cantidad", "1")),
-                str(i.get("importe", "0.00"))
-            ))
-            
-        return header_results, items_results
+    with open(filepath, 'rb') as f:
+        file_data = base64.b64encode(f.read()).decode('utf-8')
 
-    finally:
-        # 5. Limpiar archivo del lado del servidor para no acumular basura
-        if uploaded_file:
-            try:
-                client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inlineData": {"mimeType": mime_type, "data": file_data}},
+                {"text": prompt}
+            ]
+        }]
+    }
+
+    # Retry loop — wait 60s on 429 (rate limit resets every minute)
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            _status("Analizando documento...")
+            resp = requests.post(url, json=payload, timeout=90)
+            
+            if resp.status_code == 429:
+                wait_time = 60  # always wait a full minute for rate limit reset
+                _status(f"Límite de solicitudes. Esperando {wait_time}s... (intento {attempt+1}/{MAX_RETRIES})")
+                time.sleep(wait_time)
+                continue
+
+            resp.raise_for_status()
+            json_resp = resp.json()
+
+            if "error" in json_resp:
+                raise RuntimeError(json_resp["error"].get("message", "Error desconocido de la API."))
+
+            raw_text = json_resp["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+            # Clean possible markdown backticks
+            if raw_text.startswith("```json"):
+                raw_text = raw_text[7:]
+            elif raw_text.startswith("```"):
+                raw_text = raw_text[3:]
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3]
+
+            return json.loads(raw_text.strip())
+
+        except requests.exceptions.HTTPError as e:
+            last_error = e
+            if resp.status_code != 429:
+                raise
+        except Exception as e:
+            last_error = e
+            raise
+
+    raise RuntimeError(f"Límite de solicitudes agotado tras {MAX_RETRIES} intentos. Esperá un minuto y volvé a intentar.\nDetalle: {last_error}")
+
+
