@@ -1186,7 +1186,7 @@ NOTAS PARA 'LISTA_PEDIDOS':
                       className="ios-card w-full max-w-lg bg-white dark:bg-gray-900 p-6 overflow-y-auto max-h-[90vh]"
                     >
                       <div className="flex justify-between items-center mb-6">
-                        <h2 className="text-xl font-bold">Editar Pedido</h2>
+                        <h2 className="text-xl font-bold">Editar Pedido (v2.1)</h2>
                         <button onClick={() => setShowEditForm(false)} className="p-2 text-gray-400">
                           <X className="w-6 h-6" />
                         </button>
