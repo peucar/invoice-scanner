@@ -46,19 +46,20 @@ export default function MobileApp() {
   const parseItemsText = (text) => {
     if (!text) return []
     return text.split('\n').filter(line => line.trim()).map(line => {
-      const isLlegado = line.includes('[v]') || line.includes('[V]')
+      // Limpiar corchetes de estado si existen (compatibilidad)
       let cleanLine = line.replace(/\[[vV xX]?\]/, '').replace('[ ]', '').trim()
 
-      // Capturar: CODIGO CANTIDAD NOTA  (la nota es texto libre opcional despues del numero)
+      const isLlegado = line.toLowerCase().includes('[v]')
+      
+      // Capturar: CODIGO CANTIDAD NOTA
       const numMatch = cleanLine.match(/^(.+?)\s+([\d.,]+)\s*(.*)$/)
-
+      
       let codigo, cantidad, nota
       if (numMatch) {
         codigo = numMatch[1].trim()
         cantidad = numMatch[2].replace(',', '.')
         nota = numMatch[3].trim() || null
       } else {
-        // Sin número: todo es código, cantidad = 1
         codigo = cleanLine
         cantidad = '1'
         nota = null
@@ -193,10 +194,10 @@ export default function MobileApp() {
       const lines = before.split('\n');
       const currentLine = lines[lines.length - 1];
       
-      if (currentLine.trim().startsWith('[')) {
+      if (currentLine.trim()) {
         e.preventDefault();
         const after = text.substring(start);
-        const newValue = before + '\n[ ] ' + after;
+        const newValue = before + '\n' + after;
         
         if (field === 'newOrder') {
           setNewOrder({ ...newOrder, itemsText: newValue });
@@ -205,9 +206,8 @@ export default function MobileApp() {
         }
         
         setTimeout(() => {
-          textarea.selectionStart = textarea.selectionEnd = start + 6;
+          textarea.selectionStart = textarea.selectionEnd = start + 1;
           textarea.focus();
-          textarea.scrollTop = textarea.scrollHeight;
         }, 0);
       }
     }
