@@ -1051,6 +1051,7 @@ export default function MobileApp() {
           <h1 className="text-xl font-extrabold tracking-tight">
             {activeTab === 'pedidos' ? 'Pedidos' :
               activeTab === 'ingreso' ? 'Escanear' : 'Ajustes'}
+            <span className="ml-2 text-[10px] font-medium text-gray-400 bg-gray-100 dark:bg-white/5 px-1.5 py-0.5 rounded-full">v2.2</span>
           </h1>
         </div>
         <div className="w-8 h-8 bg-blue-500/10 rounded-full flex items-center justify-center">
