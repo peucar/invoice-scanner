@@ -8,8 +8,22 @@ class SupabaseManager:
     Mirror of OrdersManager but using Supabase as the backend.
     """
     def __init__(self):
-        url = os.environ.get("SUPABASE_URL")
-        key = os.environ.get("SUPABASE_KEY")
+    def __init__(self):
+        # Load from mobile-app/.env.local if present
+        env_path = os.path.join(os.path.dirname(__file__), "mobile-app", ".env.local")
+        url, key = None, None
+        if os.path.exists(env_path):
+            with open(env_path, "r") as f:
+                content = f.read()
+                url_m = re.search(r'NEXT_PUBLIC_SUPABASE_URL=(.+)', content)
+                key_m = re.search(r'NEXT_PUBLIC_SUPABASE_ANON_KEY=(.+)', content)
+                if url_m: url = url_m.group(1).strip()
+                if key_m: key = key_m.group(1).strip()
+
+        # Fallback to env vars
+        url = url or os.environ.get("SUPABASE_URL")
+        key = key or os.environ.get("SUPABASE_KEY")
+        
         if not url or not key:
             print("[WARN] Supabase credentials missing. Cloud sync disabled.")
             self.client = None
@@ -114,6 +128,10 @@ class SupabaseManager:
             return False
 
     def _check_and_update_state(self, pedido_id: int):
+        # Obtain current state to preserve 'Enviado'
+        res_ped = self.client.table("pedidos").select("estado").eq("id", pedido_id).execute()
+        current_state = res_ped.data[0]["estado"] if res_ped.data else "Pendiente"
+
         res = self.client.table("items").select("cantidad_pedida, cantidad_entregada").eq("pedido_id", pedido_id).execute()
         items = res.data
         
@@ -122,6 +140,10 @@ class SupabaseManager:
         any_delivered = sum(1 for i in items if i['cantidad_entregada'] > 0)
         
         new_state = "Completado" if completed == total else ("Parcial" if any_delivered > 0 else "Pendiente")
+        
+        if new_state == "Pendiente" and current_state.capitalize() == "Enviado":
+            new_state = "Enviado"
+
         self.client.table("pedidos").update({"estado": new_state}).eq("id", pedido_id).execute()
 
     def update_order(self, pedido_id: int, fecha: str, proveedor: str, items: list):
@@ -191,7 +213,7 @@ class SupabaseManager:
             print(f"[ERROR] Supabase sync history: {e}")
 
     def get_history(self):
-        if not self.client: return []
+        if not self.client: return [], {}, {}
         res = self.client.table("documentos_historia").select("*").order("created_at", desc=True).execute()
         history = []
         items_dict = {}
@@ -202,3 +224,35 @@ class SupabaseManager:
             items_dict[r['documento_id']] = r['items_json']
             totals_dict[r['documento_id']] = r['totals_json']
         return history, items_dict, totals_dict
+
+    # OCR Tasks Bridge
+    def get_pending_ocr_tasks(self):
+        if not self.client: return []
+        try:
+            res = self.client.table("ocr_tasks").select("*").eq("status", "pending").execute()
+            return res.data
+        except Exception as e:
+            print(f"[ERROR] Supabase get_pending_ocr_tasks: {e}")
+            return []
+
+    def update_ocr_task(self, task_id: str, status: str, result_json: dict = None, error_msg: str = None):
+        if not self.client: return
+        try:
+            update_data = {"status": status}
+            if result_json: update_data["result_json"] = result_json
+            if error_msg: update_data["error_msg"] = error_msg
+            self.client.table("ocr_tasks").update(update_data).eq("id", task_id).execute()
+        except Exception as e:
+            print(f"[ERROR] Supabase update_ocr_task: {e}")
+
+    def download_scan_image(self, storage_path: str, local_dest: str):
+        if not self.client: return
+        try:
+            # storage_path is the relative path in the 'scans' bucket
+            with open(local_dest, 'wb+') as f:
+                res = self.client.storage.from_('scans').download(storage_path)
+                f.write(res)
+            return True
+        except Exception as e:
+            print(f"[ERROR] Supabase download image: {e}")
+            return False

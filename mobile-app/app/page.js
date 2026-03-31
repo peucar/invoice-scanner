@@ -234,20 +234,10 @@ export default function MobileApp() {
   };
 
   const handleScanClick = () => { // For camera/images
-    if (!geminiApiKey) {
-      alert("Por favor, configura tu Gemini API Key en los ajustes.")
-      setActiveTab('configuracion')
-      return
-    }
     fileInputRef.current?.click()
   }
 
   const handleImportClick = () => { // For File Upload (PDF/Image)
-    if (!geminiApiKey) {
-      alert("Por favor, configura tu Gemini API Key en los ajustes.")
-      setActiveTab('configuracion')
-      return
-    }
     pdfInputRef.current?.click()
   }
 
@@ -371,131 +361,134 @@ export default function MobileApp() {
   const handleFileSelect = async (e) => {
     const file = e.target.files[0]
     if (!file) return
+    if (!supabase) {
+      alert("Configura Supabase en los ajustes primero.")
+      return
+    }
     setScanning(true)
 
     try {
-      const reader = new FileReader()
-      const base64Data = await new Promise((resolve) => {
-        reader.onloadend = () => resolve(reader.result.split(',')[1])
-        reader.readAsDataURL(file)
-      })
+      // 1. Upload to Supabase Storage 'scans' bucket
+      const fileExt = file.name.split('.').pop()
+      const fileName = `${Math.random().toString(36).substring(2)}-${Date.now()}.${fileExt}`
+      const filePath = `uploads/${fileName}`
 
-      const prompt = `Eres un sistema experto en extraer datos de documentos comerciales.
-Este documento puede ser una Factura/Remito oficial O una Lista de Pedidos (por ejemplo, exportada de un bloc de notas).
+      const { data: uploadData, error: uploadErr } = await supabase.storage
+        .from('scans')
+        .upload(filePath, file)
 
-Analiza el documento y determina su tipo: 'FACTURA', 'REMITO' o 'LISTA_PEDIDOS'.
+      if (uploadErr) throw uploadErr
 
-1. Si es 'FACTURA' o 'REMITO':
-   - Extrae el ENCABEZADO (Proveedor, Número, Fecha DD/MM/YYYY, Total, Tipo, Remito Vinculado).
-   - Extrae los ARTICULOS (codigo, descripcion, cantidad, importe).
+      // 2. Insert OCR Task
+      const { data: taskData, error: taskErr } = await supabase
+        .from('ocr_tasks')
+        .insert({ image_url: filePath, status: 'pending' })
+        .select()
+        .single()
 
-2. Si es 'LISTA_PEDIDOS':
-Responde ESTRICTAMENTE con un solo objeto JSON sin formato markdown extra.
-Estructura:
-{
-  "tipo": "FACTURA" | "REMITO" | "LISTA_PEDIDOS",
-  "factura_data": {
-    "encabezado": [ {"campo": "...", "valor": "..."} ],
-    "articulos": [ {"codigo": "...", "descripcion": "...", "cantidad": "...", "importe": "..."} ]
-  },
-  "pedidos_data": [
-    { 
-      "proveedor": "...", 
-      "fecha": "DD/MM/YYYY",
-      "articulos": [ 
-        {"codigo": "...", "cantidad": "...", "llegado": boolean} 
-      ] 
-    }
-  ]
-}
+      if (taskErr) throw taskErr
+      const taskId = taskData.id
 
-NOTAS PARA 'LISTA_PEDIDOS':
-- El formato suele ser "CÓDIGO X CANTIDAD" (ej: 1103P8 X 1).
-- Un producto está "llegado": true si tiene un checkmark (v) marcado O si el texto está tachado (strikethrough).
-- Los encabezados (ej: "Pedido Original") deben tomarse como el "proveedor" si no hay uno más específico.
-- Si ves una fecha arriba (ej: 21/10/25), inclúyela en el campo "fecha".`
+      // 3. Poll/Subscribe for completion
+      // We'll use a polling fallback since Realtime can sometimes be finicky on mobile
+      let attempts = 0
+      const maxAttempts = 60 // 60 seconds timeout
+      
+      const poll = setInterval(async () => {
+        attempts++
+        const { data: updatedTask, error: pollErr } = await supabase
+          .from('ocr_tasks')
+          .select('*')
+          .eq('id', taskId)
+          .single()
 
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiApiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { inlineData: { mimeType: file.type, data: base64Data } },
-              { text: prompt }
-            ]
-          }]
-        })
-      })
+        if (pollErr) {
+          clearInterval(poll)
+          setScanning(false)
+          alert("Error consultando estado del OCR.")
+          return
+        }
 
-      const jsonResp = await response.json()
-      if (jsonResp.error) throw new Error(jsonResp.error.message)
-
-      let rawText = jsonResp.candidates[0].content.parts[0].text.trim()
-      if (rawText.startsWith('\`\`\`json')) rawText = rawText.slice(7)
-      if (rawText.startsWith('\`\`\`')) rawText = rawText.slice(3)
-      if (rawText.endsWith('\`\`\`')) rawText = rawText.slice(0, -3)
-
-      const data = JSON.parse(rawText.trim())
-
-      if (data.tipo === 'LISTA_PEDIDOS') {
-        const ordersToReview = (data.pedidos_data || []).map(ped => ({
-          ...ped,
-          fecha: ped.fecha || new Date().toLocaleDateString('es-AR')
-        }))
-        setReviewOrders(ordersToReview)
-        setShowReviewModal(true)
-        return
-      }
-
-      // Lógica para Factura/Remito
-      const fData = data.factura_data || data
-      let prov = "-", nro = "-", fec = "-", monto = "-", is_remito = false, link_id = "-"
-      for (const item of fData.encabezado || []) {
-        const k = item.campo.toLowerCase()
-        const v = item.valor
-        if (k.includes("proveedor")) prov = v
-        else if (k.includes("número") || k.includes("nro")) nro = v
-        else if (k.includes("fecha")) fec = v
-        else if (k.includes("total") && !k.includes("sub")) monto = v
-        else if (k.includes("tipo") && k.includes("documento")) is_remito = v.toLowerCase().includes("remito") && !v.toLowerCase().includes("factura")
-        else if (k.includes("remito vinculado")) link_id = v
-      }
-
-      const itemsFormatted = (fData.articulos || []).map(i => ({
-        codigo: i.codigo || "-",
-        descripcion: i.descripcion || "-",
-        cantidad: i.cantidad || "1",
-        importe: i.importe || "0.00",
-        llegado: true // Por defecto en una factura asumimos que llega todo, el usuario puede "destachar"
-      }))
-
-      setReviewMetadata({
-        tipo: data.tipo,
-        proveedor: prov,
-        numero: nro,
-        fecha: fec,
-        monto: monto,
-        is_remito: is_remito,
-        remito_vinculado: link_id,
-        rawItems: itemsFormatted
-      })
-
-      setReviewOrders([{
-        proveedor: prov,
-        fecha: fec,
-        articulos: itemsFormatted
-      }])
-
-      setShowReviewModal(true)
+        if (updatedTask.status === 'completed') {
+          clearInterval(poll)
+          setScanning(false)
+          handleOCRResult(updatedTask.result_json)
+        } else if (updatedTask.status === 'error') {
+          clearInterval(poll)
+          setScanning(false)
+          alert("Error en el procesado del PC: " + updatedTask.error_msg)
+        } else if (attempts >= maxAttempts) {
+          clearInterval(poll)
+          setScanning(false)
+          alert("Tiempo de espera agotado. ¿Está prendida la PC con la app abierta?")
+        }
+      }, 1000)
 
     } catch (err) {
-      alert("Error escaneando: " + err.message)
-    } finally {
+      alert("Error iniciando escaneo: " + (err.message || String(err)))
       setScanning(false)
+    } finally {
       if (fileInputRef.current) fileInputRef.current.value = ''
       if (pdfInputRef.current) pdfInputRef.current.value = ''
     }
+  }
+
+  const handleOCRResult = (data) => {
+    if (!data) return
+    
+    if (data.tipo === 'LISTA_PEDIDOS') {
+      const ordersToReview = (data.pedidos_data || []).map(ped => ({
+        ...ped,
+        fecha: ped.fecha || new Date().toLocaleDateString('es-AR')
+      }))
+      setReviewOrders(ordersToReview)
+      setShowReviewModal(true)
+      return
+    }
+
+    // Lógica para Factura/Remito
+    const fData = data.factura_data || data
+    let prov = "-", nro = "-", fec = "-", monto = "-", is_remito = false, link_id = "-"
+    
+    // El motor local devuelve un formato un poco diferente pero compatible
+    // Si viene del motor local 'ocr_engine.py', ya viene mapeado en scanner.py
+    for (const item of fData.encabezado || []) {
+      const k = item.campo.toLowerCase()
+      const v = item.valor
+      if (k.includes("proveedor")) prov = v
+      else if (k.includes("número") || k.includes("nro")) nro = v
+      else if (k.includes("fecha")) fec = v
+      else if (k.includes("total") && !k.includes("sub")) monto = v
+      else if (k.includes("tipo") && k.includes("documento")) is_remito = v.toLowerCase().includes("remito") && !v.toLowerCase().includes("factura")
+      else if (k.includes("remito vinculado")) link_id = v
+    }
+
+    const itemsFormatted = (fData.articulos || []).map(i => ({
+      codigo: i.codigo || "-",
+      descripcion: i.descripcion || "-",
+      cantidad: i.cantidad || "1",
+      importe: i.importe || "0.00",
+      llegado: true
+    }))
+
+    setReviewMetadata({
+      tipo: data.tipo || 'FACTURA',
+      proveedor: prov,
+      numero: nro,
+      fecha: fec,
+      monto: monto,
+      is_remito: is_remito,
+      remito_vinculado: link_id,
+      rawItems: itemsFormatted
+    })
+
+    setReviewOrders([{
+      proveedor: prov,
+      fecha: fec,
+      articulos: itemsFormatted
+    }])
+
+    setShowReviewModal(true)
   }
 
   const formatDateForDB = (dateStr) => {

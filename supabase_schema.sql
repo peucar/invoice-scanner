@@ -40,3 +40,17 @@ CREATE TABLE IF NOT EXISTS documentos_historia (
 -- ALTER PUBLICATION supabase_realtime ADD TABLE pedidos;
 -- ALTER PUBLICATION supabase_realtime ADD TABLE items;
 -- ALTER PUBLICATION supabase_realtime ADD TABLE documentos_historia;
+-- ALTER PUBLICATION supabase_realtime ADD TABLE ocr_tasks;
+
+-- 4. Table: OCR Tasks (Queue for Local processing)
+CREATE TABLE IF NOT EXISTS ocr_tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'error')),
+    image_url TEXT NOT NULL, -- Path in Supabase Storage bucket 'scans'
+    result_json JSONB, -- Final parsed result for UI
+    error_msg TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- Note: In Supabase Dashboard, create a PUBLIC bucket named 'scans'.
+-- No RLS needed for now if public, but for production use 'authenticated' only.

@@ -17,9 +17,12 @@ import threading
 import csv
 import json
 import socket
+import tempfile
 import tkinter as tk
 from tkinter import filedialog
 import customtkinter as ctk
+
+from ocr_engine import scan_invoice as local_scan_invoice
 
 import theme as T
 from components import DropZone, DataTable, SAMPLE_DATA, _bind_hover, OrderCard, FloatingSearchBar
@@ -1789,28 +1792,91 @@ class App(ctk.CTk):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 6. Global Background OCR Worker (For Mobile Bridge)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OCRWorkerThread(threading.Thread):
+    def __init__(self, db_manager):
+        super().__init__(daemon=True)
+        self.db = db_manager
+        self.running = True
+
+    def run(self):
+        print("[OCR-WORKER] Iniciado. Escuchando pedidos desde el celular (ocr_tasks)...")
+        while self.running:
+            if not self.db or not self.db.client:
+                time.sleep(10)
+                continue
+
+            try:
+                tasks = self.db.get_pending_ocr_tasks()
+                for task in tasks:
+                    task_id = task['id']
+                    image_path = task['image_url']
+                    print(f"[OCR-WORKER] Procesando tarea: {task_id} ({image_path})")
+                    
+                    try:
+                        self.db.update_ocr_task(task_id, "processing")
+                        
+                        # 1. Download to temp file
+                        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                            tmp_path = tmp.name
+                        
+                        if self.db.download_scan_image(image_path, tmp_path):
+                            # 2. Process with local engine
+                            result = local_scan_invoice(tmp_path)
+                            
+                            # 3. Update task as completed with JSON result
+                            self.db.update_ocr_task(task_id, "completed", result_json=result)
+                            print(f"[OCR-WORKER] Tarea completada con éxito.")
+                        else:
+                            raise Exception("Fallo la descarga de la imagen.")
+                        
+                        # Cleanup
+                        if os.path.exists(tmp_path): os.remove(tmp_path)
+
+                    except Exception as e:
+                        print(f"[OCR-WORKER] Error procesando {task_id}: {e}")
+                        self.db.update_ocr_task(task_id, "error", error_msg=str(e))
+            except Exception as e:
+                print(f"[OCR-WORKER] Error en loop: {e}")
+            
+            time.sleep(3) # Poll every 3 seconds
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point (With Drag and Drop active)
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Prevent multiple instances
+    import socket
+    import sys
+    from orders_db import OrdersManager
+    from supabase_manager import SupabaseManager
+    
+    # ── Singleton protection ──────────────────────────────────────────────────
     _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         # Usamos un puerto específico para Peucar App
         _lock_socket.bind(('127.0.0.1', 49155))
     except socket.error:
-        # Si no podemos bindear, es que ya hay otra instancia
         print("[ALERTA] Ya hay una instancia de Peucar App ejecutándose.")
         sys.exit(0)
 
-    # Mantener la referencia del socket viva
+    # Initialize Managers
+    db_local = OrdersManager()
+    db_cloud = SupabaseManager()
+    
+    # Start the worker if Supabase is available
+    if db_cloud and db_cloud.client:
+        worker = OCRWorkerThread(db_cloud)
+        worker.start()
 
     # Optional: try to enable DnD (tkinterdnd2)
     try:
         from tkinterdnd2 import TkinterDnD
         class _DnDApp(App, TkinterDnD.Tk): pass  # type: ignore
-        app = _DnDApp()
+        app = _DnDApp(db_manager=db_local)
     except ImportError:
-        app = App()
+        app = App(db_manager=db_local)
 
     app.mainloop()
