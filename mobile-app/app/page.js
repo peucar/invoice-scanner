@@ -803,12 +803,6 @@ export default function MobileApp() {
     }
   }
 
-  const handleReviewOrderChange = (idx, field, value) => {
-    const updated = [...reviewOrders]
-    updated[idx][field] = value
-    setReviewOrders(updated)
-  }
-
   const handleToggleLlegado = (orderIdx, artIdx) => {
     const updated = [...reviewOrders]
     updated[orderIdx].articulos[artIdx].llegado = !updated[orderIdx].articulos[artIdx].llegado
