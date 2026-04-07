@@ -1146,7 +1146,13 @@ export default function MobileApp() {
           <h1 className="text-xl font-extrabold tracking-tight">
             {activeTab === 'pedidos' ? 'Pedidos' :
               activeTab === 'ingreso' ? 'Escanear' : 'Ajustes'}
-            <span className="ml-2 text-[10px] font-medium text-gray-400 bg-gray-100 dark:bg-white/5 px-1.5 py-0.5 rounded-full">v2.5 - ACTUALIZADO</span>
+            <button 
+              onClick={() => window.location.reload(true)} 
+              className="ml-2 text-[10px] font-medium text-blue-500 bg-blue-500/10 hover:bg-blue-500/20 px-2 py-0.5 rounded-full border border-blue-500/20 shadow-sm active:scale-95 transition-all"
+              title="Actualizar Aplicación"
+            >
+              🔄 Actualizar v2.6 - FINAL
+            </button>
           </h1>
         </div>
         <div className="w-8 h-8 bg-blue-500/10 rounded-full flex items-center justify-center">
