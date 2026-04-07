@@ -25,6 +25,5 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo Iniciando aplicacion...
-start /b py main.py
-timeout /t 1 /nobreak >nul
-exit
+%PYTHON_CMD% main.py
+pause

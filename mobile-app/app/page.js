@@ -11,7 +11,7 @@ export default function MobileApp() {
   const [search, setSearch] = useState('')
   const [activeTab, setActiveTab] = useState('pedidos') // pedidos | ingreso | configuracion
   const [defaultPhone, setDefaultPhone] = useState('')
-  const [geminiApiKey, setGeminiApiKey] = useState('AIzaSyB-5_LeLZwJbN1irxWtGR3w2wLoThNB0kk')
+  const [geminiApiKey, setGeminiApiKey] = useState('') // No longer used
   const [supaUrl, setSupaUrl] = useState('')
   const [supaKey, setSupaKey] = useState('')
   const [showSidebar, setShowSidebar] = useState(false)
@@ -34,9 +34,25 @@ export default function MobileApp() {
   const [pasteType, setPasteType] = useState('create') // 'create' | 'arrival'
   const [pasteData, setPasteData] = useState({ proveedor: '', fecha: '', rawText: '' })
   const [expandedOrderId, setExpandedOrderId] = useState(null)
+  const [scanStatus, setScanStatus] = useState('Iniciando...')
+  const [scanPreview, setScanPreview] = useState(null)
   const [showStatusPicker, setShowStatusPicker] = useState(null) // order.id o null
   const fileInputRef = useRef(null) // For images/camera
   const pdfInputRef = useRef(null) // For PDFs
+  const processedTasks = useRef(new Set())
+  const scanTimeoutRef = useRef(null)
+
+  const isCodeMatch = (codeStr, searchStr) => {
+    if (!searchStr || !searchStr.trim()) return false;
+    const terms = searchStr.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+    const codeLow = String(codeStr || '').toLowerCase();
+    const cleanCode = codeLow.replace(/[^a-z0-9]/g, '');
+    
+    return terms.some(term => {
+      const cleanTerm = term.replace(/[^a-z0-9]/g, '');
+      return codeLow.includes(term) || (cleanTerm.length > 0 && cleanCode.includes(cleanTerm));
+    });
+  }
 
   const formatCode = (code) => {
     if (!code) return ''
@@ -144,11 +160,22 @@ export default function MobileApp() {
     return dateStr
   }
 
-  const filteredOrders = orders.filter(o =>
-    (o.proveedor || '').toLowerCase().includes(search.toLowerCase()) ||
-    (o.fecha || '').includes(search) ||
-    displayDate(o.fecha).includes(search)
-  )
+  const filteredOrders = orders.filter(o => {
+    if (!search || !search.trim()) return true;
+    
+    // Split search into individual terms for multi-word search (e.g. "Albens 1234")
+    const terms = search.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+    
+    // Every term must match *somewhere* in the order (provider, date, or any item)
+    return terms.every(term => {
+      const provMatch = (o.proveedor || '').toLowerCase().includes(term);
+      const dateMatch = (o.fecha || '').includes(term) || displayDate(o.fecha).includes(term);
+      // Items match if ANY item code matches this specific term
+      const itemsMatch = (o.items || []).some(item => isCodeMatch(item.codigo, term));
+      
+      return provMatch || dateMatch || itemsMatch;
+    });
+  });
 
   const activeOrders = filteredOrders.filter(o => o.estado?.toLowerCase() !== 'enviado')
   const enviadosOrders = filteredOrders.filter(o => o.estado?.toLowerCase() === 'enviado')
@@ -366,6 +393,16 @@ export default function MobileApp() {
       return
     }
     setScanning(true)
+    setScanStatus('Subiendo imagen...')
+    
+    // Create local preview
+    if (file.type.startsWith('image/')) {
+      const reader = new FileReader()
+      reader.onload = (re) => setScanPreview(re.target.result)
+      reader.readAsDataURL(file)
+    } else {
+      setScanPreview(null)
+    }
 
     try {
       // 1. Upload to Supabase Storage 'scans' bucket
@@ -377,7 +414,9 @@ export default function MobileApp() {
         .from('scans')
         .upload(filePath, file)
 
-      if (uploadErr) throw uploadErr
+      if (uploadErr) {
+        throw new Error(`[PASO 1: SUBIDA FOTO] ${uploadErr.message}`)
+      }
 
       // 2. Insert OCR Task
       const { data: taskData, error: taskErr } = await supabase
@@ -386,46 +425,79 @@ export default function MobileApp() {
         .select()
         .single()
 
-      if (taskErr) throw taskErr
+      if (taskErr) {
+        throw new Error(`[PASO 2: AVISO TABLA] ${taskErr.message}`)
+      }
       const taskId = taskData.id
-
-      // 3. Poll/Subscribe for completion
-      // We'll use a polling fallback since Realtime can sometimes be finicky on mobile
-      let attempts = 0
-      const maxAttempts = 60 // 60 seconds timeout
       
-      const poll = setInterval(async () => {
-        attempts++
-        const { data: updatedTask, error: pollErr } = await supabase
-          .from('ocr_tasks')
-          .select('*')
-          .eq('id', taskId)
-          .single()
+      // 3. Realtime Subscription for completion
+      setScanStatus('Esperando a la PC...')
+      
+      const channel = supabase
+        .channel(`task-${taskId}`)
+        .on('postgres_changes', 
+          { event: 'UPDATE', schema: 'public', table: 'ocr_tasks', filter: `id=eq.${taskId}` }, 
+          (payload) => {
+            const updatedTask = payload.new
+            
+            if (updatedTask.status === 'processing') {
+              setScanStatus('PC Trabajando...')
+            } else if (updatedTask.status === 'completed') {
+              supabase.removeChannel(channel)
+              handleOCRResult(updatedTask.result_json, taskId)
+            } else if (updatedTask.status === 'error') {
+              supabase.removeChannel(channel)
+              setScanning(false)
+              alert("Error en el procesado del PC: " + updatedTask.error_msg)
+            }
+          }
+        )
+        .subscribe()
 
-        if (pollErr) {
-          clearInterval(poll)
-          setScanning(false)
-          alert("Error consultando estado del OCR.")
+      // Fallback polling (cada 5 seg) en caso de que Realtime falle o sea lento
+      const pollInterval = setInterval(async () => {
+        // Correct check for scanning state using a closure-safe way if possible, 
+        // but here we just want to stop if the task is already processed.
+        if (processedTasks.current.has(taskId)) {
+          clearInterval(pollInterval)
           return
         }
 
-        if (updatedTask.status === 'completed') {
-          clearInterval(poll)
-          setScanning(false)
-          handleOCRResult(updatedTask.result_json)
-        } else if (updatedTask.status === 'error') {
-          clearInterval(poll)
-          setScanning(false)
-          alert("Error en el procesado del PC: " + updatedTask.error_msg)
-        } else if (attempts >= maxAttempts) {
-          clearInterval(poll)
-          setScanning(false)
-          alert("Tiempo de espera agotado. ¿Está prendida la PC con la app abierta?")
+        const { data, error } = await supabase.from('ocr_tasks').select('*').eq('id', taskId).single()
+        if (!error && data && data.status !== 'pending') {
+          if (data.status === 'processing') setScanStatus('PC Trabajando...')
+          if (data.status === 'completed' || data.status === 'error') {
+            clearInterval(pollInterval)
+            supabase.removeChannel(channel)
+            
+            if (data.status === 'completed') {
+              handleOCRResult(data.result_json, taskId)
+            } else {
+              setScanning(false)
+              alert("Error en el procesado: " + data.error_msg)
+            }
+          }
         }
-      }, 1000)
+      }, 5000)
+
+      // Fallback timeout total (5 min)
+      if (scanTimeoutRef.current) clearTimeout(scanTimeoutRef.current)
+      scanTimeoutRef.current = setTimeout(() => {
+        clearInterval(pollInterval)
+        supabase.removeChannel(channel)
+        setScanning((prev) => {
+          if (prev) {
+            alert("Tiempo de espera agotado (5 min).\n\nPOSIBLES CAUSAS:\n1. La PC está lenta (espera unos segundos más y refresca).\n2. La PC está pausada (presiona ENTER en la ventana negra).\n3. Sin internet.")
+            return false
+          }
+          return false
+        })
+      }, 300000)
 
     } catch (err) {
-      alert("Error iniciando escaneo: " + (err.message || String(err)))
+      console.error('Scan Error:', err)
+      const msg = err.message || JSON.stringify(err)
+      alert(`[ERROR v2.4 - 16:10hs] ${msg}`)
       setScanning(false)
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = ''
@@ -433,8 +505,17 @@ export default function MobileApp() {
     }
   }
 
-  const handleOCRResult = (data) => {
+  const handleOCRResult = (data, taskId) => {
     if (!data) return
+    // Clear timeout immediately
+    if (scanTimeoutRef.current) clearTimeout(scanTimeoutRef.current)
+    
+    // Deduplication check
+    if (taskId && processedTasks.current.has(taskId)) return
+    if (taskId) processedTasks.current.add(taskId)
+
+    setScanning(false)
+    setScanPreview(null)
     
     if (data.tipo === 'LISTA_PEDIDOS') {
       const ordersToReview = (data.pedidos_data || []).map(ped => ({
@@ -568,6 +649,26 @@ export default function MobileApp() {
     } finally {
       setLoading(false)
     }
+  }
+
+  const handleReviewOrderChange = (idx, field, value) => {
+    setReviewOrders(prev => {
+      const copy = [...prev]
+      copy[idx] = { ...copy[idx], [field]: value }
+      return copy
+    })
+  }
+
+  const handleReviewItemChange = (orderIdx, itemIdx, field, value) => {
+    setReviewOrders(prev => {
+      const copy = [...prev]
+      const orderCopy = { ...copy[orderIdx] }
+      const itemsCopy = [...orderCopy.articulos]
+      itemsCopy[itemIdx] = { ...itemsCopy[itemIdx], [field]: value }
+      orderCopy.articulos = itemsCopy
+      copy[orderIdx] = orderCopy
+      return copy
+    })
   }
 
   const handleConfirmImport = async () => {
@@ -1011,7 +1112,7 @@ export default function MobileApp() {
                         {group.items.map(item => (
                           <div key={item.id} className="flex justify-between items-center text-sm py-0.5">
                             <div className="flex items-baseline gap-2">
-                              <span className={item.cantidad_entregada >= item.cantidad_pedida ? "text-gray-400 dark:text-gray-600 line-through" : "dark:text-gray-300"}>
+                              <span className={`${item.cantidad_entregada >= item.cantidad_pedida ? "text-gray-400 dark:text-gray-600 line-through" : "dark:text-gray-300"} ${search && isCodeMatch(item.codigo, search) ? "bg-yellow-200 dark:bg-yellow-900/50 text-yellow-900 dark:text-yellow-100 px-1 rounded-md" : ""}`}>
                                 {formatCode(item.codigo)}
                               </span>
                               {item.nota && (
@@ -1051,7 +1152,7 @@ export default function MobileApp() {
           <h1 className="text-xl font-extrabold tracking-tight">
             {activeTab === 'pedidos' ? 'Pedidos' :
               activeTab === 'ingreso' ? 'Escanear' : 'Ajustes'}
-            <span className="ml-2 text-[10px] font-medium text-gray-400 bg-gray-100 dark:bg-white/5 px-1.5 py-0.5 rounded-full">v2.2</span>
+            <span className="ml-2 text-[10px] font-medium text-gray-400 bg-gray-100 dark:bg-white/5 px-1.5 py-0.5 rounded-full">v2.5 - ACTUALIZADO</span>
           </h1>
         </div>
         <div className="w-8 h-8 bg-blue-500/10 rounded-full flex items-center justify-center">
@@ -1254,7 +1355,7 @@ export default function MobileApp() {
                 <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-[--text-secondary] w-4 h-4" />
                 <input
                   type="text"
-                  placeholder="Buscar por proveedor o fecha..."
+                  placeholder="Buscar por proveedor, fecha o código..."
                   className="w-full pl-11 pr-4 py-3 bg-black/5 dark:bg-white/5 rounded-2xl outline-none focus:ring-2 ring-[--accent]/20 transition-all border border-transparent"
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
@@ -1265,6 +1366,10 @@ export default function MobileApp() {
               <section className="px-1 py-6 space-y-4">
                 {loading ? (
                   <div className="text-center py-20 text-[--text-secondary]">Cargando pedidos...</div>
+                ) : filteredOrders.length === 0 ? (
+                  <div className="text-center py-20 text-gray-400">
+                    {search ? 'No se encontraron repuestos o pedidos con esa búsqueda.' : 'No hay pedidos. ¡Añade uno nuevo!'}
+                  </div>
                 ) : (
                   <>
                     <AnimatePresence>
@@ -1284,12 +1389,12 @@ export default function MobileApp() {
                             <span className="font-bold text-purple-700 dark:text-purple-300">Pedidos Enviados ({enviadosOrders.length})</span>
                           </div>
                           <div className="text-purple-400">
-                            {showEnviados ? <ChevronDown className="w-5 h-5" /> : <ChevronRight className="w-5 h-5" />}
+                            {(showEnviados || search.trim().length > 0) ? <ChevronDown className="w-5 h-5" /> : <ChevronRight className="w-5 h-5" />}
                           </div>
                         </button>
                         
                         <AnimatePresence>
-                          {showEnviados && (
+                          {(showEnviados || search.trim().length > 0) && (
                             <motion.div
                               initial={{ height: 0, opacity: 0 }}
                               animate={{ height: 'auto', opacity: 1 }}
@@ -1331,7 +1436,8 @@ export default function MobileApp() {
               <div className="grid grid-cols-1 gap-4">
                 <button
                   onClick={handleScanClick}
-                  className="group relative overflow-hidden bg-white dark:bg-white/5 border border-gray-100 dark:border-white/10 p-6 rounded-[2rem] text-left transition-all active:scale-[0.98] shadow-sm hover:shadow-md"
+                  disabled={scanning}
+                  className="group relative overflow-hidden bg-white dark:bg-white/5 border border-gray-100 dark:border-white/10 p-6 rounded-[2rem] text-left transition-all active:scale-[0.98] shadow-sm hover:shadow-md disabled:opacity-50"
                 >
                   <div className="flex items-center gap-5">
                     <div className="w-14 h-14 bg-blue-600 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-blue-500/30">
@@ -1346,7 +1452,8 @@ export default function MobileApp() {
 
                 <button
                   onClick={handleImportClick}
-                  className="group relative overflow-hidden bg-white dark:bg-white/5 border border-gray-100 dark:border-white/10 p-6 rounded-[2rem] text-left transition-all active:scale-[0.98] shadow-sm hover:shadow-md"
+                  disabled={scanning}
+                  className="group relative overflow-hidden bg-white dark:bg-white/5 border border-gray-100 dark:border-white/10 p-6 rounded-[2rem] text-left transition-all active:scale-[0.98] shadow-sm hover:shadow-md disabled:opacity-50"
                 >
                   <div className="flex items-center gap-5">
                     <div className="w-14 h-14 bg-indigo-600 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-indigo-500/30">
@@ -1361,7 +1468,8 @@ export default function MobileApp() {
 
                 <button
                   onClick={() => handlePasteTextClick('arrival')}
-                  className="group relative overflow-hidden bg-white dark:bg-white/5 border border-gray-100 dark:border-white/10 p-6 rounded-[2rem] text-left transition-all active:scale-[0.98] shadow-sm hover:shadow-md"
+                  disabled={scanning}
+                  className="group relative overflow-hidden bg-white dark:bg-white/5 border border-gray-100 dark:border-white/10 p-6 rounded-[2rem] text-left transition-all active:scale-[0.98] shadow-sm hover:shadow-md disabled:opacity-50"
                 >
                   <div className="flex items-center gap-5">
                     <div className="w-14 h-14 bg-purple-600 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-purple-500/30">
@@ -1424,19 +1532,7 @@ export default function MobileApp() {
                     <p className="text-xs text-gray-500 mt-1">Si está vacío, elegirás a quién enviar cada vez.</p>
                   </div>
 
-                  <div className="pt-2">
-                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                      Gemini API Key
-                    </label>
-                    <input
-                      type="password"
-                      value={geminiApiKey}
-                      onChange={(e) => saveApiKey(e.target.value)}
-                      placeholder="AIzaSy..."
-                      className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3"
-                    />
-                    <p className="text-xs text-gray-500 mt-1">Requerido para el escaneo inteligente de documentos.</p>
-                  </div>
+                  {/* Removed Gemini API Key input as we use local PC motor now */}
 
                   <div className="pt-2 border-t border-gray-100 mt-4">
                     <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
@@ -1567,8 +1663,6 @@ export default function MobileApp() {
         onChange={handleFileSelect}
       />
 
-
-
       {/* Review Modal for PDF Import */}
       <AnimatePresence>
         {showReviewModal && reviewOrders && (
@@ -1581,111 +1675,159 @@ export default function MobileApp() {
             <motion.div
               initial={{ scale: 0.9, y: 20 }}
               animate={{ scale: 1, y: 0 }}
-              className="bg-white dark:bg-[#1c1c1e] rounded-[2.5rem] w-full max-w-lg max-h-[85vh] overflow-hidden flex flex-col shadow-2xl"
+              className="bg-white dark:bg-[#1c1c1e] rounded-[2.5rem] w-full max-w-5xl max-h-[90vh] overflow-hidden flex flex-col shadow-2xl"
             >
-              <div className="p-6 border-b border-gray-100 dark:border-gray-800 flex justify-between items-center">
+              <div className="p-6 border-b border-gray-100 dark:border-gray-800 flex justify-between items-center bg-white dark:bg-[#1c1c1e]">
                 <div>
-                  <h3 className="text-xl font-bold">{reviewMetadata ? `Ingreso: ${reviewMetadata.tipo}` : 'Revisar Pedidos'}</h3>
+                  <h3 className="text-xl font-extrabold tracking-tight">{reviewMetadata ? `Ingreso: ${reviewMetadata.tipo}` : 'Revisar Pedidos'}</h3>
                   {reviewMetadata && (
                     <p className="text-[10px] font-bold text-blue-500 uppercase tracking-widest mt-0.5">
                       {reviewMetadata.numero} • {reviewMetadata.monto}
                     </p>
                   )}
                 </div>
-                <button onClick={() => { setShowReviewModal(false); setReviewMetadata(null); }} className="p-2 bg-gray-100 dark:bg-white/5 rounded-full">
-                  <X className="w-5 h-5" />
+                <button onClick={() => { setShowReviewModal(false); setReviewMetadata(null); }} className="p-2 bg-gray-100 dark:bg-white/5 rounded-full hover:bg-gray-200 transition-all">
+                  <X className="w-5 h-5 text-gray-800 dark:text-white" />
                 </button>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                <p className="text-sm text-gray-500 mb-2">
-                  {reviewMetadata 
-                    ? "Toca los productos para confirmar su ingreso (tachado = llegó)." 
-                    : "Confirma o edita los datos antes de guardar los pedidos."}
-                </p>
-                {reviewOrders.map((ped, idx) => (
-                  <div key={idx} className="bg-gray-50 dark:bg-white/5 p-5 rounded-3xl space-y-4 border border-gray-100 dark:border-gray-800 shadow-sm">
-                    {!reviewMetadata && (
-                      <div className="flex gap-3">
+              {/* SPLIT VIEW START */}
+              <div className="flex-1 overflow-hidden flex flex-col md:flex-row">
+                
+                {/* ─── LEFT: IMAGE PREVIEW ─── */}
+                <div className="hidden md:flex md:w-[45%] bg-gray-100 dark:bg-black/40 border-r border-gray-100 dark:border-gray-800 items-center justify-center p-6 overflow-auto">
+                    {scanPreview ? (
+                      <div className="relative group max-w-full">
+                        <img 
+                          src={scanPreview} 
+                          alt="Invoice Scan" 
+                          className="w-full h-auto rounded-xl shadow-2xl transition-transform cursor-zoom-in"
+                        />
+                        <div className="absolute top-4 left-4 bg-black/50 backdrop-blur px-3 py-1.5 rounded-lg text-white text-[10px] font-bold uppercase tracking-widest opacity-0 group-hover:opacity-100 transition-opacity">
+                          Vista Original
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col items-center text-gray-400 gap-4">
+                        <Camera size={48} className="opacity-20" />
+                        <p className="text-xs font-medium">No hay imagen para mostrar</p>
+                      </div>
+                    )}
+                </div>
+
+                {/* ─── RIGHT: DATA FORM ─── */}
+                <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6 bg-gray-50/30 dark:bg-transparent">
+                  <div className="mb-2">
+                    <p className="text-xs font-bold text-blue-600 dark:text-blue-400 uppercase tracking-widest px-1">Verificación de datos</p>
+                    <p className="text-sm text-gray-500 mt-1 px-1">Corrige cualquier dato que la IA no haya detectado bien.</p>
+                  </div>
+
+                  {reviewOrders.map((ped, idx) => (
+                    <div key={idx} className="bg-white dark:bg-white/5 p-6 rounded-[2rem] space-y-5 border border-gray-100 dark:border-gray-800 shadow-sm transition-all hover:shadow-md">
+                      
+                      {/* Cabecera del pedido / Datos Generales */}
+                      <div className="flex flex-col sm:flex-row gap-4">
                         <div className="flex-1">
-                          <label className="block text-[10px] font-bold text-gray-400 uppercase mb-1 ml-1">Proveedor</label>
-                          <div className="relative">
-                            <Package className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+                          <label className="block text-[10px] font-extrabold text-gray-400 dark:text-gray-500 uppercase mb-2 ml-1 tracking-widest">Proveedor / Pedido</label>
+                          <div className="relative group">
+                            <Package className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 group-focus-within:text-blue-500 transition-colors" />
                             <input
-                              className="w-full pl-9 pr-4 py-2.5 bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-xl text-sm outline-none focus:ring-2 ring-blue-500/20"
+                              className="w-full pl-11 pr-4 py-3 bg-gray-50 dark:bg-gray-900/50 border border-transparent focus:border-blue-500/30 dark:focus:border-blue-500/50 rounded-2xl text-sm font-bold outline-none ring-0 focus:ring-4 ring-blue-500/10 transition-all uppercase"
                               value={ped.proveedor}
                               onChange={(e) => handleReviewOrderChange(idx, 'proveedor', e.target.value)}
                             />
                           </div>
                         </div>
-                        <div className="w-32">
-                          <label className="block text-[10px] font-bold text-gray-400 uppercase mb-1 ml-1">Fecha</label>
-                          <div className="relative">
-                            <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+                        <div className="sm:w-40">
+                          <label className="block text-[10px] font-extrabold text-gray-400 dark:text-gray-500 uppercase mb-2 ml-1 tracking-widest tracking-widest">Fecha</label>
+                          <div className="relative group">
+                            <Calendar className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 group-focus-within:text-blue-500 transition-colors" />
                             <input
-                              className="w-full pl-9 pr-4 py-2.5 bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-xl text-sm outline-none focus:ring-2 ring-blue-500/20"
+                              className="w-full pl-11 pr-4 py-3 bg-gray-50 dark:bg-gray-900/50 border border-transparent focus:border-blue-500/30 dark:focus:border-blue-500/50 rounded-2xl text-sm font-bold outline-none ring-0 focus:ring-4 ring-blue-500/10 transition-all"
                               value={ped.fecha}
                               onChange={(e) => handleReviewOrderChange(idx, 'fecha', e.target.value)}
                             />
                           </div>
                         </div>
                       </div>
-                    )}
 
-                    {reviewMetadata && (
-                       <div className="flex items-center justify-between px-1">
-                          <span className="text-sm font-bold dark:text-gray-200">{ped.proveedor}</span>
-                          <span className="text-[10px] text-gray-500">{ped.fecha}</span>
-                       </div>
-                    )}
-
-                    <div className="pt-2">
-                      <p className="text-[10px] font-bold text-gray-400 uppercase mb-2 ml-1">Artículos ({ped.articulos.length})</p>
-                      <div className="max-h-64 overflow-y-auto space-y-3 pr-1 custom-scrollbar">
-                        {ped.articulos.map((art, aidx) => (
-                          <div 
-                            key={aidx} 
-                            onClick={() => handleToggleLlegado(idx, aidx)}
-                            className={`flex justify-between items-center px-4 py-3.5 rounded-2xl text-xs border transition-all active:scale-[0.97] cursor-pointer ${
-                              art.llegado 
-                                ? "bg-green-500/10 border-green-500/20 dark:bg-green-500/5 shadow-sm" 
-                                : "bg-white dark:bg-gray-900 border-gray-100 dark:border-gray-800 opacity-60"
-                            }`}
-                          >
-                            <div className="flex items-center gap-3">
-                              <div className={`w-5 h-5 rounded-full flex items-center justify-center border ${art.llegado ? 'bg-green-500 border-green-500 text-white' : 'border-gray-300 dark:border-gray-700'}`}>
-                                {art.llegado && <Check className="w-3 h-3 stroke-[3]" />}
+                      {/* Artículos Editables */}
+                      <div className="space-y-3">
+                        <div className="flex justify-between items-center px-1">
+                          <p className="text-[10px] font-extrabold text-gray-400 dark:text-gray-500 uppercase tracking-widest">Artículos Detectados ({ped.articulos.length})</p>
+                          {!reviewMetadata && <p className="text-[9px] text-blue-500 font-bold uppercase">Editable</p>}
+                        </div>
+                        
+                        <div className="space-y-3 pb-2">
+                          {ped.articulos.map((art, aidx) => (
+                            <div 
+                              key={aidx}
+                              className={`flex flex-col sm:flex-row items-stretch sm:items-center gap-3 p-4 rounded-2xl border transition-all ${
+                                art.llegado 
+                                  ? "bg-green-500/5 border-green-500/20 dark:border-green-500/10" 
+                                  : "bg-gray-50/50 dark:bg-gray-900/50 border-gray-100 dark:border-gray-800"
+                              }`}
+                            >
+                              <div className="flex items-center gap-3 flex-1 min-w-0">
+                                <button 
+                                  onClick={() => handleToggleLlegado(idx, aidx)}
+                                  className={`w-6 h-6 flex-shrink-0 rounded-full flex items-center justify-center border transition-all ${
+                                    art.llegado ? 'bg-green-500 border-green-500 text-white shadow-sm shadow-green-500/30' : 'border-gray-300 dark:border-gray-700 hover:border-blue-400'
+                                  }`}
+                                >
+                                  {art.llegado && <Check className="w-4 h-4 stroke-[3]" />}
+                                </button>
+                                
+                                <div className="flex flex-col flex-1 min-w-0">
+                                  <input
+                                    className={`bg-transparent p-0 text-sm font-bold border-none outline-none focus:ring-0 ${art.llegado ? 'text-green-700 dark:text-green-400' : 'dark:text-white'}`}
+                                    value={art.codigo}
+                                    placeholder="Código"
+                                    onChange={(e) => handleReviewItemChange(idx, aidx, 'codigo', e.target.value.toUpperCase())}
+                                  />
+                                  <input
+                                    className="bg-transparent p-0 text-[10px] text-gray-400 border-none outline-none focus:ring-0 truncate w-full"
+                                    value={art.descripcion || '-'}
+                                    placeholder="Descripción"
+                                    onChange={(e) => handleReviewItemChange(idx, aidx, 'descripcion', e.target.value)}
+                                  />
+                                </div>
                               </div>
-                              <span className={art.llegado ? "line-through text-green-700 dark:text-green-400 font-bold" : "text-gray-700 dark:text-gray-300 font-medium"}>
-                                {art.codigo}
-                              </span>
+                              
+                              <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-1 bg-white/40 dark:bg-black/20 rounded-xl px-2 py-1">
+                                  <span className="text-[10px] font-bold text-gray-400">Qty:</span>
+                                  <input
+                                    type="number"
+                                    step="any"
+                                    className="w-16 bg-transparent border-none outline-none focus:ring-0 text-sm font-black text-center"
+                                    value={art.cantidad}
+                                    onChange={(e) => handleReviewItemChange(idx, aidx, 'cantidad', e.target.value)}
+                                  />
+                                </div>
+                              </div>
                             </div>
-                            <div className="flex flex-col items-end">
-                              <span className={`font-black text-sm ${art.llegado ? 'text-green-600' : ''}`}>x{art.cantidad}</span>
-                              {art.descripcion && art.descripcion !== "-" && (
-                                <span className="text-[9px] text-gray-400 truncate max-w-[140px] text-right mt-0.5">{art.descripcion}</span>
-                              )}
-                            </div>
-                          </div>
-                        ))}
+                          ))}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
+              {/* SPLIT VIEW END */}
 
-              <div className="p-6 bg-gray-50/50 dark:bg-black/20 border-t border-gray-100 dark:border-gray-800">
+              <div className="p-6 bg-white dark:bg-[#1c1c1e] border-t border-gray-100 dark:border-gray-800 shadow-[0_-10px_20px_rgba(0,0,0,0.1)]">
                 <button
                   onClick={handleConfirmImport}
                   disabled={loading}
-                  className={`w-full h-16 rounded-3xl font-bold shadow-lg flex items-center justify-center gap-3 active:scale-[0.98] transition-all disabled:opacity-50 ${reviewMetadata ? 'bg-green-600 shadow-green-500/30' : 'bg-blue-600 shadow-blue-500/30'}`}
+                  className={`w-full h-18 py-4 rounded-3xl font-black text-lg shadow-xl flex items-center justify-center gap-4 active:scale-[0.98] transition-all disabled:opacity-50 ${reviewMetadata ? 'bg-green-600 shadow-green-500/20 text-white' : 'bg-blue-600 shadow-blue-500/20 text-white'}`}
                 >
                   {loading ? (
-                    <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                    <div className="w-6 h-6 border-3 border-white/30 border-t-white rounded-full animate-spin"></div>
                   ) : (
                     <>
-                      <CheckCircle2 className="w-6 h-6" />
-                      <span>{reviewMetadata ? 'Confirmar Ingreso de Mercadería' : 'Confirmar e Importar Pedidos'}</span>
+                      <CheckCircle2 className="w-7 h-7" />
+                      <span>{reviewMetadata ? 'CONFIRMAR INGRESO' : 'GUARDAR PEDIDOS'}</span>
                     </>
                   )}
                 </button>
@@ -1755,10 +1897,25 @@ export default function MobileApp() {
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-6"
           >
-            <div className="bg-white dark:bg-[#1c1c1e] p-8 rounded-3xl w-full max-w-sm flex flex-col items-center">
-              <div className="w-16 h-16 border-4 border-[--accent] border-t-transparent rounded-full animate-spin mb-6"></div>
-              <h3 className="text-xl font-bold mb-2">Procesando imagen...</h3>
-              <p className="text-center text-[--text-secondary] text-sm">Nuestra IA está leyendo los datos de la factura.</p>
+            <div className="bg-white dark:bg-[#1c1c1e] p-8 rounded-[2.5rem] w-full max-w-sm flex flex-col items-center text-center shadow-2xl border border-gray-100 dark:border-gray-800">
+              {scanPreview ? (
+                <div className="w-32 h-44 mb-6 rounded-2xl overflow-hidden shadow-lg border border-gray-200 dark:border-gray-700 relative bg-gray-100 dark:bg-black/20">
+                  <img src={scanPreview} alt="Preview" className="w-full h-full object-cover opacity-60" />
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                  </div>
+                </div>
+              ) : (
+                <div className="w-16 h-16 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-6"></div>
+              )}
+              <h3 className="text-xl font-bold mb-2">{scanStatus}</h3>
+              <p className="text-center text-gray-500 text-sm px-4">
+                {scanStatus === 'Esperando a la PC...' 
+                  ? 'La PC ha recibido la imagen y está por comenzar.' 
+                  : scanStatus === 'PC Trabajando...'
+                  ? 'Nuestra IA está leyendo los datos localmente.'
+                  : (scanStatus === 'Subiendo imagen...' ? 'Enviando foto a la nube...' : 'Preparando proceso móvil.')}
+              </p>
             </div>
           </motion.div>
         )}

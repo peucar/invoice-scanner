@@ -48,7 +48,8 @@ def scan_invoice(filepath: str, api_key: str = None, status_callback=None) -> Di
             "tipo": "FACTURA", # Default to FACTURA for now
             "factura_data": {
                 "encabezado": encabezado,
-                "articulos": articulos
+                "articulos": articulos,
+                "full_text": data.get("full_text", "")
             }
         }
         

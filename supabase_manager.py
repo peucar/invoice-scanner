@@ -8,17 +8,19 @@ class SupabaseManager:
     Mirror of OrdersManager but using Supabase as the backend.
     """
     def __init__(self):
-    def __init__(self):
         # Load from mobile-app/.env.local if present
         env_path = os.path.join(os.path.dirname(__file__), "mobile-app", ".env.local")
         url, key = None, None
         if os.path.exists(env_path):
-            with open(env_path, "r") as f:
-                content = f.read()
-                url_m = re.search(r'NEXT_PUBLIC_SUPABASE_URL=(.+)', content)
-                key_m = re.search(r'NEXT_PUBLIC_SUPABASE_ANON_KEY=(.+)', content)
-                if url_m: url = url_m.group(1).strip()
-                if key_m: key = key_m.group(1).strip()
+            try:
+                with open(env_path, "r") as f:
+                    for line in f:
+                        if '=' in line:
+                            k, v = line.split('=', 1)
+                            if 'URL' in k: url = v.strip().strip("'").strip('"')
+                            if 'KEY' in k: key = v.strip().strip("'").strip('"')
+            except Exception as e:
+                print(f"[ERROR] Leyendo .env.local: {e}")
 
         # Fallback to env vars
         url = url or os.environ.get("SUPABASE_URL")
@@ -29,7 +31,12 @@ class SupabaseManager:
             self.client = None
             return
         
-        self.client: Client = create_client(url, key)
+        try:
+            self.client: Client = create_client(url, key)
+            print(f"[STATUS] Conectado a Supabase: {url}")
+        except Exception as e:
+            print(f"[ERROR] Falló conexión a Supabase: {e}")
+            self.client = None
 
     def add_order(self, fecha: str, proveedor: str, items: list):
         """
@@ -244,6 +251,23 @@ class SupabaseManager:
             self.client.table("ocr_tasks").update(update_data).eq("id", task_id).execute()
         except Exception as e:
             print(f"[ERROR] Supabase update_ocr_task: {e}")
+
+    def get_completed_ocr_tasks(self):
+        """Fetches tasks that are completed but not yet imported/archived."""
+        if not self.client: return []
+        try:
+            res = self.client.table("ocr_tasks").select("*").eq("status", "completed").execute()
+            return res.data
+        except Exception as e:
+            print(f"[ERROR] Supabase get_completed_ocr_tasks: {e}")
+            return []
+
+    def delete_ocr_task(self, task_id: str):
+        if not self.client: return
+        try:
+            self.client.table("ocr_tasks").delete().eq("id", task_id).execute()
+        except Exception as e:
+            print(f"[ERROR] Supabase delete_ocr_task: {e}")
 
     def download_scan_image(self, storage_path: str, local_dest: str):
         if not self.client: return

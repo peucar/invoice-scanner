@@ -22,12 +22,14 @@ import tkinter as tk
 from tkinter import filedialog
 import customtkinter as ctk
 
+from PIL import Image
 from ocr_engine import scan_invoice as local_scan_invoice
 
 import theme as T
 from components import DropZone, DataTable, SAMPLE_DATA, _bind_hover, OrderCard, FloatingSearchBar
 from scanner import scan_invoice
 from supabase_manager import SupabaseManager
+from orders_db import OrdersManager
 
 CONFIG_FILE = "config.json"
 
@@ -46,6 +48,12 @@ def save_persisted_config(data: dict):
             json.dump(data, f)
     except Exception:
         pass
+
+# ── Load persistent config early (to ensure worker has credentials) ──────────
+_early_cfg = get_persisted_config()
+if "SUPABASE_URL" in _early_cfg: os.environ["SUPABASE_URL"] = _early_cfg["SUPABASE_URL"]
+if "SUPABASE_KEY" in _early_cfg: os.environ["SUPABASE_KEY"] = _early_cfg["SUPABASE_KEY"]
+if "GEMINI_API_KEY" in _early_cfg: os.environ["GEMINI_API_KEY"] = _early_cfg["GEMINI_API_KEY"]
 
 HISTORY_FILE = "history.json"
 
@@ -281,7 +289,7 @@ class TopUploadPanel(ctk.CTkFrame):
     def _on_drop(self, event):
         self._on_drag_leave()
         path = event.data.strip().strip("{}")
-        self._load_file(path)
+        self._load_files([path])
 
     def _open_dialog(self, event=None):
         paths = filedialog.askopenfilenames(
@@ -538,6 +546,8 @@ class InvoiceDetailsTopLevel(ctk.CTkToplevel):
         y = py + (ph - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(500, 300)
+        self.after(100, self.lift)
+        self.after(110, self.focus_force)
 
         # Main container card
         content = ctk.CTkFrame(self, fg_color=T.BG_CARD, corner_radius=T.RADIUS_LG, border_width=1, border_color=T.BORDER)
@@ -592,16 +602,42 @@ class InvoiceDetailsTopLevel(ctk.CTkToplevel):
             ("Cantidad",    80),
             ("Importe",     100),
         ]
+        self.table = DataTable(content, columns=table_columns)
+        self.table.pack(fill="both", expand=True, padx=20, pady=5)
+        self.table.load_data(items_data)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pending Scans Panel (For Mobile Sync)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PendingScansPanel(ctk.CTkFrame):
+    def __init__(self, parent, on_review_click, **kw):
+        super().__init__(parent, fg_color=T.BG_CARD, corner_radius=T.RADIUS_MD, 
+                         border_color=T.ACCENT, border_width=1, **kw)
+        self.on_review_click = on_review_click
+        self._build()
+
+    def _build(self):
+        self.grid_columnconfigure(1, weight=1)
         
-        table_frame = ctk.CTkFrame(content, fg_color="transparent")
-        table_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        table_frame.grid_rowconfigure(0, weight=1)
-        table_frame.grid_columnconfigure(0, weight=1)
+        self.icon = ctk.CTkLabel(self, text="📱", font=(T.FONT_FALLBACK, 20))
+        self.icon.grid(row=0, column=0, padx=15, pady=10)
         
-        self.table = DataTable(table_frame, columns=table_columns, data=items_data)
-        self.table.grid(row=0, column=0, sticky="nsew")
+        self.text = ctk.CTkLabel(self, text="Hay escaneos pendientes del celular", 
+                                font=T.FONT_H3, text_color=T.TEXT_PRIMARY)
+        self.text.grid(row=0, column=1, sticky="w")
         
-        self.grab_set() # Focus lock
+        self.btn = ctk.CTkButton(self, text="Revisar y Guardar", 
+                                font=T.FONT_BTN, height=32,
+                                fg_color=T.ACCENT, hover_color=T.ACCENT_HOVER,
+                                command=self.on_review_click)
+        self.btn.grid(row=0, column=2, padx=15, pady=10)
+
+    def set_count(self, count):
+        if count == 1:
+            self.text.configure(text="Tienes 1 escaneo pendiente del celular")
+        else:
+            self.text.configure(text=f"Tienes {count} escaneos pendientes del celular")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -741,58 +777,90 @@ class OrderEditDialog(ctk.CTkToplevel):
         self.on_save(self.order_data['id'], new_date, new_prov, parsed_items)
         self.destroy()
 
-class ScanOverlay(ctk.CTkToplevel):
-    """Simple overlay to show scanning status."""
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.overrideredirect(True)
-        self.attributes("-alpha", 0.8)
-        self.configure(fg_color=T.BG_APP)
-        self.lbl = ctk.CTkLabel(self, text="Escaneando...", font=T.FONT_H2, text_color=T.TEXT_PRIMARY)
-        self.lbl.pack(expand=True, padx=40, pady=40)
-        
-        # Center on parent
-        self.update_idletasks()
-        pw, ph = parent.winfo_width(), parent.winfo_height()
-        px, py = parent.winfo_rootx(), parent.winfo_rooty()
-        w, h = self.winfo_width(), self.winfo_height()
-        self.geometry(f"{w}x{h}+{px+(pw-w)//2}+{py+(ph-h)//2}")
-        
-    def set_status(self, text):
-        self.lbl.configure(text=text)
-        
-    def hide(self):
-        self.destroy()
-
 class ReviewImportDialog(ctk.CTkToplevel):
     """Dialog to review and edit orders extracted from a PDF/Image before final import."""
-    def __init__(self, parent, orders_data, on_confirm):
+    def __init__(self, parent, orders_data, on_confirm, image_path=None, raw_text=""):
         super().__init__(parent)
         self.title("Revisar Importación")
         self.transient(parent)
         self.configure(fg_color=T.BG_APP)
         self.orders = orders_data
         self.on_confirm = on_confirm
+        self.image_path = image_path
+        self.raw_text = raw_text
 
-        # Center
+        # Center & Sizing
         self.update_idletasks()
-        pw, ph = parent.winfo_width(), parent.winfo_height()
-        px, py = parent.winfo_rootx(), parent.winfo_rooty()
-        w, h = 600, 700
-        x = px + (pw - w) // 2
-        y = py + (ph - h) // 2
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        
+        # Determine optimal size based on screen
+        w = min(1100 if self.image_path else 650, int(sw * 0.95))
+        h = min(850, int(sh * 0.9))
+        
+        # Center relative to screen for better stability
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        
         self.geometry(f"{w}x{h}+{x}+{y}")
+        self.resizable(True, True) # Allow manual resize if needed
 
         # Main Layout
-        self.container = ctk.CTkFrame(self, fg_color=T.BG_CARD, corner_radius=T.RADIUS_LG, border_width=1, border_color=T.BORDER)
-        self.container.pack(fill="both", expand=True, padx=20, pady=20)
+        self.main_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.main_container.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        if self.image_path:
+            self.left_panel = ctk.CTkFrame(self.main_container, fg_color=T.BG_CARD, corner_radius=T.RADIUS_LG, border_width=1, border_color=T.BORDER)
+            self.left_panel.pack(side="left", fill="both", expand=True, padx=(0, 15))
+            
+            ctk.CTkLabel(self.left_panel, text="Imagen Original", font=T.FONT_H3).pack(pady=10)
+            
+            try:
+                img = Image.open(self.image_path)
+                # Maximize size inside panel
+                pw_img, ph_img = img.size
+                aspect = pw_img / ph_img
+                target_h = 600
+                target_w = int(target_h * aspect)
+                if target_w > 500:
+                    target_w = 500
+                    target_h = int(target_w / aspect)
+                
+                ctk_img = ctk.CTkImage(light_image=img, size=(target_w, target_h))
+                img_lbl = ctk.CTkLabel(self.left_panel, image=ctk_img, text="")
+                img_lbl.pack(pady=10, padx=10, expand=True)
+            except Exception as e:
+                ctk.CTkLabel(self.left_panel, text=f"Error cargando imagen: {e}").pack(pady=20)
+
+            self.container = ctk.CTkFrame(self.main_container, fg_color=T.BG_CARD, corner_radius=T.RADIUS_LG, border_width=1, border_color=T.BORDER, width=550)
+            self.container.pack(side="left", fill="both", expand=False)
+            # Re-enabled propagation to allow vertical adaptability
+            self.container.pack_propagate(True)
+        else:
+            self.container = ctk.CTkFrame(self.main_container, fg_color=T.BG_CARD, corner_radius=T.RADIUS_LG, border_width=1, border_color=T.BORDER)
+            self.container.pack(fill="both", expand=True)
 
         ctk.CTkLabel(self.container, text="Revisar Pedidos Detectados", font=T.FONT_H2, text_color=T.TEXT_PRIMARY).pack(pady=(20, 10))
         ctk.CTkLabel(self.container, text="Verifica la fecha y el proveedor antes de confirmar.", font=T.FONT_SMALL, text_color=T.TEXT_TERTIARY).pack()
 
+        # Raw Text View (New)
+        f_raw = ctk.CTkFrame(self.container, fg_color=T.BG_APP, corner_radius=T.RADIUS_SM)
+        f_raw.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(f_raw, text="🔍 Texto Extraído (Lectura Cruda):", font=(T.FONT_FALLBACK, 11, "bold"), text_color=T.TEXT_SECONDARY).pack(anchor="w", padx=10, pady=(5, 0))
+        
+        self.txt_raw = ctk.CTkTextbox(f_raw, height=250, font=(T.FONT_FALLBACK, 11), fg_color=T.BG_CARD, text_color=T.TEXT_TERTIARY, border_width=1, border_color=T.BORDER)
+        self.txt_raw.pack(fill="x", padx=10, pady=10)
+        
+        if self.raw_text:
+            self.txt_raw.insert("1.0", self.raw_text)
+        else:
+            self.txt_raw.insert("1.0", "--- NO SE PUDO EXTRAER TEXTO CRUDO ---\n(Probablemente esta tarea fue creada antes de los cambios de hoy o la imagen es ilegible).")
+        
+        self.txt_raw.configure(state="disabled")
+
         # Scrollable area for orders
         self.scroll = ctk.CTkScrollableFrame(self.container, fg_color="transparent")
-        self.scroll.pack(fill="both", expand=True, padx=10, pady=15)
+        self.scroll.pack(fill="both", expand=True, padx=10, pady=(0, 15))
 
         self.order_rows = []
         for i, order in enumerate(self.orders):
@@ -803,7 +871,17 @@ class ReviewImportDialog(ctk.CTkToplevel):
         f_btns.pack(fill="x", side="bottom", padx=20, pady=20)
 
         ctk.CTkButton(f_btns, text="Cancelar", command=self.destroy, fg_color="transparent", border_width=1, border_color=T.BORDER, text_color=T.TEXT_PRIMARY).pack(side="right", padx=5)
-        ctk.CTkButton(f_btns, text="Confirmar e Importar", command=self._confirm, fg_color=T.ACCENT, hover_color=T.ACCENT_HOVER).pack(side="right")
+        
+        self.btn_confirm = ctk.CTkButton(f_btns, text="Confirmar e Importar", command=self._confirm, fg_color=T.ACCENT, hover_color=T.ACCENT_HOVER)
+        self.btn_confirm.pack(side="right")
+        
+        self.btn_rescan = ctk.CTkButton(
+            f_btns, text="🔄 Re-escanear en PC", font=T.FONT_BTN,
+            fg_color="transparent", border_width=1, border_color=T.BORDER,
+            text_color=T.TEXT_PRIMARY, hover_color=T.BG_HOVER,
+            command=self._on_rescan
+        )
+        self.btn_rescan.pack(side="left", padx=15)
 
     def _add_order_row(self, order, idx):
         row = ctk.CTkFrame(self.scroll, fg_color=T.BG_APP, corner_radius=T.RADIUS_MD, border_width=1, border_color=T.BORDER)
@@ -826,10 +904,100 @@ class ReviewImportDialog(ctk.CTkToplevel):
 
         # Items Preview (Summary)
         items = order.get('articulos', [])
-        summary = f"{len(items)} artículos detectados"
-        ctk.CTkLabel(row, text=summary, font=T.FONT_MICRO, text_color=T.TEXT_TERTIARY).pack(anchor="w", padx=15, pady=(0, 10))
+        summary = f"📦 {len(items)} artículos detectados"
+        ctk.CTkLabel(row, text=summary, font=T.FONT_SMALL, text_color=T.TEXT_TERTIARY).pack(anchor="w", padx=15, pady=(5, 5))
+
+        # Items Detail (List)
+        items_frame = ctk.CTkFrame(row, fg_color=T.BG_CARD, corner_radius=T.RADIUS_SM)
+        items_frame.pack(fill="x", padx=15, pady=(0, 10))
+
+        
+        for item in items:
+            code = item.get('codigo', '-')
+            desc = item.get('descripcion', '-')
+            qty = item.get('cantidad', '1')
+            imp = item.get('importe', '-')
+            
+            # Card for each item
+            it_card = ctk.CTkFrame(items_frame, fg_color=T.BG_APP, corner_radius=T.RADIUS_SM, border_width=1, border_color=T.BORDER)
+            it_card.pack(fill="x", padx=5, pady=2)
+
+            f_main = ctk.CTkFrame(it_card, fg_color="transparent")
+            f_main.pack(fill="x", padx=10, pady=5)
+
+            ctk.CTkLabel(f_main, text=f"📄 {code}", font=(T.FONT_FALLBACK, 12, "bold"), text_color=T.TEXT_PRIMARY, anchor="w").pack(side="left")
+            
+            btn_del = ctk.CTkButton(f_main, text="🗑️", width=30, height=24, fg_color="transparent", hover_color=T.BG_HOVER, text_color=T.ERROR, 
+                                    command=lambda c=it_card, it=item: self._remove_item(c, it, items))
+            btn_del.pack(side="right")
+            
+            ctk.CTkLabel(f_main, text=f"    💰 ${imp}", font=(T.FONT_FALLBACK, 12, "bold"), text_color=T.ACCENT, anchor="e").pack(side="right", padx=10)
+            
+            ctk.CTkLabel(it_card, text=f"📝 {desc}", font=T.FONT_MICRO, text_color=T.TEXT_SECONDARY, anchor="w", wraplength=400).pack(fill="x", padx=10, pady=(0, 2))
+            ctk.CTkLabel(it_card, text=f"🔢 Cantidad: {qty}", font=T.FONT_MICRO, text_color=T.TEXT_TERTIARY, anchor="w").pack(fill="x", padx=10, pady=(0, 5))
 
         self.order_rows.append({'date_ent': ent_date, 'prov_ent': ent_prov, 'articulos': items})
+
+    def _remove_item(self, card, item, item_list):
+        item_list.remove(item)
+        card.destroy()
+
+    def _on_rescan(self):
+        import threading
+        from scanner import scan_invoice as local_scan_invoice
+        
+        self.btn_rescan.configure(state="disabled", text="⌛ Escaneando...")
+        
+        def run_ocr():
+            try:
+                import scanner
+                
+                res = scanner.scan_invoice(self.image_path)
+                data = res.get("factura_data", {})
+                self.after(0, lambda: self._update_rescan_results(data))
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.after(0, lambda: self.btn_rescan.configure(state="normal", text="❌ Error OCR"))
+
+        threading.Thread(target=run_ocr, daemon=True).start()
+
+    def _update_rescan_results(self, data):
+        self.btn_rescan.configure(state="normal", text="🔄 Re-escanear en PC")
+        
+        # 1. Update text fields
+        headers = data.get("encabezado", [])
+        new_fec = ""
+        new_prov = ""
+        for h in headers:
+            if h["campo"] == "Fecha": new_fec = h["valor"]
+            if h["campo"] == "Proveedor": new_prov = h["valor"]
+            
+        # Update raw text
+        self.raw_text = data.get("full_text", "")
+        if hasattr(self, "txt_raw"):
+            self.txt_raw.configure(state="normal")
+            self.txt_raw.delete("1.0", "end")
+            self.txt_raw.insert("1.0", self.raw_text or "--- NO SE DETECTÓ TEXTO (LA IMAGEN PODRÍA ESTAR BORROSA) ---")
+            self.txt_raw.configure(state="disabled")
+
+        # 2. Update orders
+        self.orders = [{
+            "fecha": new_fec or self.orders[0].get("fecha"),
+            "proveedor": new_prov or self.orders[0].get("proveedor"),
+            "articulos": data.get("articulos", [])
+        }]
+        
+        # 3. Clear and rebuild rows
+        for row_data in self.order_rows:
+             # Just clear the list and container children
+             pass
+        self.order_rows.clear()
+        for child in self.scroll.winfo_children():
+            child.destroy()
+            
+        for i, order in enumerate(self.orders):
+            self._add_order_row(order, i)
 
     def _force_upper(self, widget):
         val = widget.get()
@@ -1241,6 +1409,10 @@ class IngresoView(ctk.CTkFrame):
         self.top_upload = TopUploadPanel(content, on_scan_click=self._do_scan)
         self.top_upload.grid(row=0, column=0, sticky="ew", pady=(0, T.GAP))
 
+        # Pending Scans Notification (Hidden by default)
+        self.pending_scans_ui = PendingScansPanel(content, on_review_click=self._review_pending)
+        self.pending_scans_data = []
+        
         # Bottom panel (table)
         self.bottom_table = BottomTablePanel(content, on_delete_click=self._on_delete_row)
         self.bottom_table.grid(row=1, column=0, sticky="nsew")
@@ -1255,7 +1427,7 @@ class IngresoView(ctk.CTkFrame):
 
     def _load_initial_data(self):
         # Cargar historial (Supabase o local fallback)
-        if self.db and self.db.client:
+        if self.db and hasattr(self.db, 'client') and self.db.client:
             hist, items, totals = self.db.get_history()
             data = {"history": hist, "items": items, "totals": totals}
         else:
@@ -1289,14 +1461,123 @@ class IngresoView(ctk.CTkFrame):
         self.invoice_totals_dict = data.get("totals", {})
         
         if self.invoice_history:
-            self.bottom_table.load_results(self.invoice_history)
+            # Mostramos solo el último scan por defecto
+            self.bottom_table.load_results(self.invoice_history[:1])
         
         self._match_indices = []
         self._current_match_ptr = -1
+        
+        # Check for any mobile scans waiting for review
+        self.check_pending_scans()
 
     def refresh_data(self):
-        """Public method to reload everything from disk."""
+        """Public method to reload everything from disk/db and check for cloud tasks."""
         self._load_initial_data()
+        self.check_pending_scans()
+
+    def check_pending_scans(self):
+        """Polls for completed OCR tasks that haven't been confirmed yet."""
+        if not self.db or not hasattr(self.db, 'get_completed_ocr_tasks'):
+            return
+            
+        def _check():
+            try:
+                tasks = self.db.get_completed_ocr_tasks()
+                self.after(0, self._update_pending_ui, tasks)
+            except: pass
+            
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _update_pending_ui(self, tasks):
+        self.pending_scans_data = tasks
+        if tasks:
+            self.pending_scans_ui.set_count(len(tasks))
+            self.pending_scans_ui.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+            # Shift bottom table down
+            self.bottom_table.grid(row=2, column=0, sticky="nsew")
+        else:
+            self.pending_scans_ui.grid_forget()
+            self.bottom_table.grid(row=1, column=0, sticky="nsew")
+
+    def _review_pending(self):
+        if not self.pending_scans_data: return
+        task = self.pending_scans_data[0]
+        data = task.get('result_json', {})
+        task_id = task['id']
+        image_url = task.get('image_url')
+
+        # Download image for preview
+        tmp_img = None
+        if image_url and self.db:
+            try:
+                suffix = os.path.splitext(image_url)[1] or ".jpg"
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp_img = tmp.name
+                if not self.db.download_scan_image(image_url, tmp_img):
+                    tmp_img = None
+            except:
+                tmp_img = None
+
+        # Map data from Scanner format back to _on_scan_done format
+        f_data = data.get('factura_data', {})
+        header_raw = f_data.get('encabezado', [])
+        items_raw = f_data.get('articulos', [])
+
+        # Convert encabezado to (campo, valor, confianza, estado)
+        results_header = []
+        for h in header_raw:
+            results_header.append((h['campo'], h['valor'], "Local", "ok"))
+        
+        # Convert items to (codigo, desc, cant, imp)
+        results_items = []
+        for i in items_raw:
+            results_items.append((i['codigo'], i['descripcion'], i['cantidad'], i['importe']))
+
+        # Show specialized review dialog with image
+        from tkinter import messagebox
+        
+        # Structure for _confirm_import: list of dicts {fecha, proveedor, articulos: list of dicts}
+        # But _on_scan_done already expects results_header/items.
+        # We need a middle ground: use ReviewImportDialog manually or trigger _on_scan_done?
+        # _on_scan_done is better because it handles all the logic of saving history etc.
+        
+        # Let's create the format for ReviewImportDialog
+        doc_type = data.get('tipo', 'FACTURA')
+        prov = next((h['valor'] for h in header_raw if 'proveedor' in h['campo'].lower()), '-')
+        fec = next((h['valor'] for h in header_raw if 'fecha' in h['campo'].lower()), '-')
+        
+        pedidos_view_data = [{
+            'fecha': fec,
+            'proveedor': prov,
+            'articulos': items_raw
+        }]
+        
+        def on_confirmed(final_orders):
+            # final_orders is [{fecha, proveedor, articulos}]
+            for order in final_orders:
+                # Map back to results_header/items for _on_scan_done
+                # header format: (campo, valor, confianza, estado)
+                h = [("Proveedor", order['proveedor'], "Local", "ok"), ("Fecha", order['fecha'], "Local", "ok")]
+                # Add other fields from original if possible
+                for field in header_raw:
+                    if 'proveedor' not in field['campo'].lower() and 'fecha' not in field['campo'].lower():
+                        h.append((field['campo'], field['valor'], "Local", "ok"))
+                
+                # items format: (codigo, desc, cant, imp)
+                its = [(art['codigo'], art.get('descripcion', '-'), art['cantidad'], art.get('importe', '0')) for art in order['articulos']]
+                
+                self._on_scan_done(None, h, its, 0)
+            
+            # Cleanup task and UI
+            self.db.delete_ocr_task(task_id)
+            if tmp_img and os.path.exists(tmp_img): os.remove(tmp_img)
+            self.refresh_data()
+            messagebox.showinfo("Sincronización", "Escaneo recuperado e importado con éxito.")
+
+        raw_ocr = f_data.get('full_text', '')
+        dlg = ReviewImportDialog(self.winfo_toplevel(), pedidos_view_data, on_confirm=on_confirmed, image_path=tmp_img, raw_text=raw_ocr)
+        dlg.lift()
+        dlg.focus_force()
 
     def on_search(self, text):
         """Filters the DataTable. Returns (current_match_idx+1, total_matches)."""
@@ -1304,14 +1585,25 @@ class IngresoView(ctk.CTkFrame):
         self._current_match_ptr = -1
         
         if not text:
-            self.bottom_table.load_results(self.invoice_history)
+            # Revertimos a mostrar solo el último scan
+            self.bottom_table.load_results(self.invoice_history[:1])
             return 0, 0
             
         t = text.upper()
         # Data structure for DataTable rows is variable, we check all strings
         self.invoice_matches = []
         for i, row in enumerate(self.invoice_history):
-            if any(t in str(cell).upper() for cell in row):
+            # Normal search in main columns
+            found = any(t in str(cell).upper() for cell in row)
+            
+            # Additional search in items code if not found yet
+            if not found:
+                nro = row[1]
+                items = self.invoice_items_dict.get(nro, [])
+                if any(t in str(item[0]).upper() for item in items):
+                    found = True
+            
+            if found:
                 self.invoice_matches.append(row)
                 self._match_indices.append(i)
                 
@@ -1336,16 +1628,47 @@ class IngresoView(ctk.CTkFrame):
         # Visual highlighting of rows in DataTable would require more component work
         pass
     def _on_row_clicked(self, row_data):
-        nro = row_data[1]  # The invoice number column
-        items = self.invoice_items_dict.get(nro, [])
-        totals = self.invoice_totals_dict.get(nro, {"subtotal": "-", "total": "-"})
-        InvoiceDetailsTopLevel(
-            self, 
-            invoice_number=nro, 
-            items_data=items,
-            subtotal=totals["subtotal"],
-            total=totals["total"]
-        )
+        try:
+            nro = row_data[1]  # The invoice number column
+            items = self.invoice_items_dict.get(nro)
+            
+            # Parse if it's a JSON string 
+            if isinstance(items, str):
+                import json
+                try:
+                    items = json.loads(items)
+                except Exception:
+                    pass
+
+            if items is None:
+                # Intento fallback por si el dict perdió la referencia pero el nro existe
+                print(f"[DEBUG] items_dict no tiene {nro}. Actuales: {list(self.invoice_items_dict.keys())}")
+                from tkinter import messagebox
+                messagebox.showwarning("Atención", f"No se encontró el detalle del documento #{nro}. Puede que sea antiguo.")
+                return
+
+            totals = self.invoice_totals_dict.get(nro, {"subtotal": "-", "total": "-"})
+            if isinstance(totals, str):
+                import json
+                try:
+                    totals = json.loads(totals)
+                except Exception:
+                    totals = {"subtotal": "-", "total": "-"}
+                    
+            dlg = InvoiceDetailsTopLevel(
+                self, 
+                invoice_number=nro, 
+                items_data=items,
+                subtotal=totals.get("subtotal", "-"),
+                total=totals.get("total", "-")
+            )
+            dlg.lift()
+            dlg.focus_force()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            from tkinter import messagebox
+            messagebox.showerror("Error", f"Fallo al abrir el detalle: {e}")
 
     def _on_delete_row(self, row_data):
         from tkinter import messagebox
@@ -1376,7 +1699,7 @@ class IngresoView(ctk.CTkFrame):
         self.invoice_totals_dict.pop(nro, None)
         
         # 3. Persistir
-        if self.db and self.db.client:
+        if self.db and hasattr(self.db, 'client') and self.db.client:
             # Supabase delete not currently implemented for history individually, but
             # realistically deleting history should also be synced eventually.
             pass
@@ -1392,9 +1715,7 @@ class IngresoView(ctk.CTkFrame):
             self._flash_drop_zone()
             return
 
-        api_key = self.get_api_key()
-        if not api_key:
-            return 
+        api_key = "local" # Ya no se requiere API key para OCR local 
 
         overlay = ScanOverlay(self)
         overlay.show()
@@ -1408,11 +1729,12 @@ class IngresoView(ctk.CTkFrame):
                     self.after(0, overlay.set_status, f"Escaneando ({i+1}/{total_files})...\n{os.path.basename(filepath)}")
                     
                     # Llamada real bloqueante
-                    results_header, results_items = scan_invoice(filepath, api_key)
+                    raw_result = scan_invoice(filepath, api_key)
                     
-                    # Actualizar UI y guardar (sincronizado en el hilo principal)
-                    self.after(0, self._on_scan_done, None, results_header, results_items, 0)
+                    # Delegar a nueva función para mostrar Preview
+                    self.after(0, self._handle_local_scan_result, filepath, raw_result)
                 
+                # Ocultar overlay tras procesar todos
                 self.after(0, overlay.hide)
                 self.after(0, overlay.destroy)
                 # Limpiar seleccion tras exito
@@ -1429,6 +1751,37 @@ class IngresoView(ctk.CTkFrame):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _handle_local_scan_result(self, filepath, raw_result):
+        f_data = raw_result.get('factura_data', {})
+        h_raw = f_data.get('encabezado', [])
+        i_raw = f_data.get('articulos', [])
+        
+        prov = next((str(h['valor']) for h in h_raw if 'proveedor' in str(h['campo']).lower()), '-')
+        fec = next((str(h['valor']) for h in h_raw if 'fecha' in str(h['campo']).lower()), '-')
+        
+        pedidos_view_data = [{
+            'fecha': fec,
+            'proveedor': prov,
+            'articulos': i_raw
+        }]
+        
+        def on_confirmed(final_orders):
+            for order in final_orders:
+                h = [("Proveedor", order['proveedor'], "Local", "ok"), ("Fecha", order['fecha'], "Local", "ok")]
+                for field in h_raw:
+                    fname = str(field.get('campo', '')).lower()
+                    if 'proveedor' not in fname and 'fecha' not in fname:
+                        h.append((field.get('campo'), field.get('valor'), "Local", "ok"))
+                
+                its = [(art.get('codigo', '-'), art.get('descripcion', '-'), art.get('cantidad', '0'), art.get('importe', '0')) for art in order['articulos']]
+                
+                self._on_scan_done(None, h, its, 0)
+                
+        raw_ocr = f_data.get('full_text', '')
+        dlg = ReviewImportDialog(self.winfo_toplevel(), pedidos_view_data, on_confirm=on_confirmed, image_path=filepath, raw_text=raw_ocr)
+        dlg.lift()
+        dlg.focus_force()
+
     def _on_scan_done(self, overlay, results_header, results_items, elapsed_s):
         if overlay:
             overlay.hide()
@@ -1441,6 +1794,10 @@ class IngresoView(ctk.CTkFrame):
         fec = "-"
         monto = "-"
         remito_vinculado = "-"
+        subtot = "-"
+        total_val = "-"
+        tipo_doc = "FACTURA"
+        link_id = "-"
         
         for k, v, c, s in results_header:
             kl = k.lower()
@@ -1501,12 +1858,12 @@ class IngresoView(ctk.CTkFrame):
         self.invoice_items_dict[nro] = results_items
         self.invoice_totals_dict[nro] = {"subtotal": subtot, "total": total_val}
         
-        if self.db and self.db.client:
-            import json
+        if self.db and hasattr(self.db, 'client') and self.db.client:
             self.db.save_history_record((prov, nro, fec, monto, estado, is_remito, link_id), json.dumps(results_items), json.dumps({"subtotal": subtot, "total": total_val}))
             
         save_history(self.invoice_history, self.invoice_items_dict, self.invoice_totals_dict)
-        self.bottom_table.load_results(self.invoice_history)
+        # Mostramos solo el último scan procesado
+        self.bottom_table.load_results(self.invoice_history[:1])
 
         # NEW: Link with Orders Database
         if self.db:
@@ -1615,7 +1972,7 @@ class ConfiguracionView(ctk.CTkFrame):
         else:
             ctk.set_appearance_mode("light")
 class App(ctk.CTk):
-    def __init__(self):
+    def __init__(self, db_manager=None):
         super().__init__()
         self.title(T.WIN_TITLE)
         self.geometry(f"{T.WIN_W}x{T.WIN_H}")
@@ -1657,11 +2014,7 @@ class App(ctk.CTk):
         self.content_container.grid_columnconfigure(0, weight=1)
 
         # DB Manager init
-        # Ensure credentials are in env before instantiating SupabaseManager
-        cfg = get_persisted_config()
-        if "SUPABASE_URL" in cfg: os.environ["SUPABASE_URL"] = cfg["SUPABASE_URL"]
-        if "SUPABASE_KEY" in cfg: os.environ["SUPABASE_KEY"] = cfg["SUPABASE_KEY"]
-        self.orders_db = SupabaseManager()
+        self.orders_db = db_manager or SupabaseManager()
 
         # Instantiate Views
         self.views = {
@@ -1800,11 +2153,19 @@ class OCRWorkerThread(threading.Thread):
         super().__init__(daemon=True)
         self.db = db_manager
         self.running = True
+        self.processing_ids = set() # Local deduplication
 
     def run(self):
         print("[OCR-WORKER] Iniciado. Escuchando pedidos desde el celular (ocr_tasks)...")
+        # Pre-cargar el motor para evitar demoras en la primera tarea
+        try:
+            from ocr_engine import prewarm_engine
+            prewarm_engine()
+        except Exception as e:
+            print(f"[OCR-WORKER] Error pre-cargando motor: {e}")
+
         while self.running:
-            if not self.db or not self.db.client:
+            if not self.db or not hasattr(self.db, 'client') or not self.db.client:
                 time.sleep(10)
                 continue
 
@@ -1812,6 +2173,8 @@ class OCRWorkerThread(threading.Thread):
                 tasks = self.db.get_pending_ocr_tasks()
                 for task in tasks:
                     task_id = task['id']
+                    if task_id in self.processing_ids: continue
+                    self.processing_ids.add(task_id)
                     image_path = task['image_url']
                     print(f"[OCR-WORKER] Procesando tarea: {task_id} ({image_path})")
                     
@@ -1822,13 +2185,18 @@ class OCRWorkerThread(threading.Thread):
                         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                             tmp_path = tmp.name
                         
+                        t_dl = time.time()
                         if self.db.download_scan_image(image_path, tmp_path):
+                            print(f"[OCR-WORKER] Imagen descargada en {time.time()-t_dl:.2f}s")
                             # 2. Process with local engine
-                            result = local_scan_invoice(tmp_path)
+                            import scanner
                             
-                            # 3. Update task as completed with JSON result
+                            result = scanner.scan_invoice(tmp_path)
+                            
+                            # 3. Update task as completed
+                            t_up = time.time()
                             self.db.update_ocr_task(task_id, "completed", result_json=result)
-                            print(f"[OCR-WORKER] Tarea completada con éxito.")
+                            print(f"[OCR-WORKER] Tarea completada y subida en {time.time()-t_up:.2f}s")
                         else:
                             raise Exception("Fallo la descarga de la imagen.")
                         
@@ -1838,20 +2206,41 @@ class OCRWorkerThread(threading.Thread):
                     except Exception as e:
                         print(f"[OCR-WORKER] Error procesando {task_id}: {e}")
                         self.db.update_ocr_task(task_id, "error", error_msg=str(e))
+                    finally:
+                        if task_id in self.processing_ids:
+                            self.processing_ids.remove(task_id)
+                
             except Exception as e:
                 print(f"[OCR-WORKER] Error en loop: {e}")
             
-            time.sleep(3) # Poll every 3 seconds
+            # Un pequeño indicador cada 30 segundos de que el worker sigue vivo
+            if int(time.time()) % 30 == 0:
+                print("[OCR-WORKER] Esperando nuevas tareas...")
+                
+            time.sleep(5) # Revisar cada 5 segundos para ahorrar CPU
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point (With Drag and Drop active)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def disable_quick_edit():
+    """Disables QuickEdit mode in Windows console to prevent pausing on click."""
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    h_stdin = kernel32.GetStdHandle(-10) # STD_INPUT_HANDLE
+    mode = ctypes.c_uint32()
+    if kernel32.GetConsoleMode(h_stdin, ctypes.byref(mode)):
+        # Disable ENABLE_QUICK_EDIT_MODE (0x0040)
+        mode.value &= ~0x0040
+        kernel32.SetConsoleMode(h_stdin, mode)
+
 if __name__ == "__main__":
-    import socket
-    import sys
-    from orders_db import OrdersManager
-    from supabase_manager import SupabaseManager
+    # Disable pausing on click (QuickEdit mode)
+    try:
+        disable_quick_edit()
+    except Exception as e:
+        print(f"[SISTEMA] No se pudo desactivar QuickEdit: {e}")
+    # Managers and types are imported at the top
     
     # ── Singleton protection ──────────────────────────────────────────────────
     _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1867,16 +2256,24 @@ if __name__ == "__main__":
     db_cloud = SupabaseManager()
     
     # Start the worker if Supabase is available
-    if db_cloud and db_cloud.client:
+    if db_cloud and hasattr(db_cloud, 'client') and db_cloud.client:
+        print("[STATUS] Lanzando escucha de escaneo móvil...")
         worker = OCRWorkerThread(db_cloud)
         worker.start()
+
+    # We prefer Cloud if available for direct sync with mobile
+    active_db = db_cloud if db_cloud and hasattr(db_cloud, 'client') and db_cloud.client else db_local
+    if active_db == db_cloud:
+        print("[STATUS] Usando base de datos de la NUBE (Sincronizado con el celular).")
+    else:
+        print("[STATUS] Usando base de datos LOCAL (Fuera de linea).")
 
     # Optional: try to enable DnD (tkinterdnd2)
     try:
         from tkinterdnd2 import TkinterDnD
         class _DnDApp(App, TkinterDnD.Tk): pass  # type: ignore
-        app = _DnDApp(db_manager=db_local)
+        app = _DnDApp(db_manager=active_db)
     except ImportError:
-        app = App(db_manager=db_local)
+        app = App(db_manager=active_db)
 
     app.mainloop()
