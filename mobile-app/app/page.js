@@ -497,7 +497,7 @@ export default function MobileApp() {
     } catch (err) {
       console.error('Scan Error:', err)
       const msg = err.message || JSON.stringify(err)
-      alert(`[ERROR v2.4 - 16:10hs] ${msg}`)
+      alert(`[ERROR v2.7] ${msg}`)
       setScanning(false)
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = ''
@@ -1151,7 +1151,7 @@ export default function MobileApp() {
               className="ml-2 text-[10px] font-medium text-blue-500 bg-blue-500/10 hover:bg-blue-500/20 px-2 py-0.5 rounded-full border border-blue-500/20 shadow-sm active:scale-95 transition-all"
               title="Actualizar Aplicación"
             >
-              🔄 Actualizar v2.6 - FINAL
+              🔄 Actualizar v2.7 - Busqueda
             </button>
           </h1>
         </div>
