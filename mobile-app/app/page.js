@@ -18,6 +18,8 @@ export default function MobileApp() {
   const [scanning, setScanning] = useState(false)
   const [showAddForm, setShowAddForm] = useState(false)
   const [showEnviados, setShowEnviados] = useState(false)
+  const [showBorradores, setShowBorradores] = useState(false)
+  const [showEnviados2, setShowEnviados2] = useState(false)
   const todayStr = () => {
     const d = new Date();
     return `${d.getDate()}/${d.getMonth()+1}/${d.getFullYear().toString().slice(-2)}`;
@@ -176,9 +178,10 @@ export default function MobileApp() {
       return provMatch || dateMatch || itemsMatch;
     });
   });
-
-  const activeOrders = filteredOrders.filter(o => o.estado?.toLowerCase() !== 'enviado')
+  const activeOrders = filteredOrders.filter(o => o.estado?.toLowerCase() !== 'enviado' && o.estado?.toLowerCase() !== 'borrador' && o.estado?.toLowerCase() !== 'enviados 2')
+  const borradorOrders = filteredOrders.filter(o => o.estado?.toLowerCase() === 'borrador')
   const enviadosOrders = filteredOrders.filter(o => o.estado?.toLowerCase() === 'enviado')
+  const enviados2Orders = filteredOrders.filter(o => o.estado?.toLowerCase() === 'enviados 2')
 
   const savePhone = (val) => {
     setDefaultPhone(val)
@@ -761,7 +764,8 @@ export default function MobileApp() {
             .insert({ 
               fecha: fecha, 
               proveedor: ped.proveedor.toUpperCase(), 
-              repuesto: ped.proveedor.toUpperCase() 
+              repuesto: ped.proveedor.toUpperCase(),
+              estado: 'Borrador'
             })
             .select()
 
@@ -1151,7 +1155,7 @@ export default function MobileApp() {
               className="ml-2 text-[10px] font-medium text-blue-500 bg-blue-500/10 hover:bg-blue-500/20 px-2 py-0.5 rounded-full border border-blue-500/20 shadow-sm active:scale-95 transition-all"
               title="Actualizar Aplicación"
             >
-              🔄 Actualizar v2.7 - Busqueda
+              🔄 Actualizar v2.8 - Borradores
             </button>
           </h1>
         </div>
@@ -1376,6 +1380,38 @@ export default function MobileApp() {
                       {activeOrders.map(renderOrderCard)}
                     </AnimatePresence>
 
+                    {borradorOrders.length > 0 && (
+                      <div className="pt-6 mt-4 border-t border-gray-100 dark:border-white/5">
+                        <button 
+                          onClick={() => setShowBorradores(!showBorradores)}
+                          className="w-full flex items-center justify-between p-4 bg-orange-50 dark:bg-orange-900/20 rounded-2xl border border-orange-100 dark:border-orange-900/30 active:scale-[0.98] transition-all"
+                        >
+                          <div className="flex items-center gap-3">
+                            <div className="w-8 h-8 rounded-full bg-orange-100 dark:bg-orange-900/50 flex items-center justify-center text-orange-600 dark:text-orange-400">
+                              <FileText className="w-4 h-4" />
+                            </div>
+                            <span className="font-bold text-orange-700 dark:text-orange-300">Borradores Texto ({borradorOrders.length})</span>
+                          </div>
+                          <div className="text-orange-400">
+                            {(showBorradores || search.trim().length > 0) ? <ChevronDown className="w-5 h-5" /> : <ChevronRight className="w-5 h-5" />}
+                          </div>
+                        </button>
+                        
+                        <AnimatePresence>
+                          {(showBorradores || search.trim().length > 0) && (
+                            <motion.div
+                              initial={{ height: 0, opacity: 0 }}
+                              animate={{ height: 'auto', opacity: 1 }}
+                              exit={{ height: 0, opacity: 0 }}
+                              className="overflow-hidden space-y-3 mt-4"
+                            >
+                              {borradorOrders.map(renderOrderCard)}
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </div>
+                    )}
+
                     {enviadosOrders.length > 0 && (
                       <div className="pt-6 mt-4 border-t border-gray-100 dark:border-white/5">
                         <button 
@@ -1402,6 +1438,38 @@ export default function MobileApp() {
                               className="overflow-hidden space-y-3 mt-4"
                             >
                               {enviadosOrders.map(renderOrderCard)}
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </div>
+                    )}
+
+                    {enviados2Orders.length > 0 && (
+                      <div className="pt-6 mt-4 border-t border-gray-100 dark:border-white/5">
+                        <button 
+                          onClick={() => setShowEnviados2(!showEnviados2)}
+                          className="w-full flex items-center justify-between p-4 bg-pink-50 dark:bg-pink-900/20 rounded-2xl border border-pink-100 dark:border-pink-900/30 active:scale-[0.98] transition-all"
+                        >
+                          <div className="flex items-center gap-3">
+                            <div className="w-8 h-8 rounded-full bg-pink-100 dark:bg-pink-900/50 flex items-center justify-center text-pink-600 dark:text-pink-400">
+                              <Send className="w-4 h-4" />
+                            </div>
+                            <span className="font-bold text-pink-700 dark:text-pink-300">Pedidos Enviados 2 ({enviados2Orders.length})</span>
+                          </div>
+                          <div className="text-pink-400">
+                            {(showEnviados2 || search.trim().length > 0) ? <ChevronDown className="w-5 h-5" /> : <ChevronRight className="w-5 h-5" />}
+                          </div>
+                        </button>
+                        
+                        <AnimatePresence>
+                          {(showEnviados2 || search.trim().length > 0) && (
+                            <motion.div
+                              initial={{ height: 0, opacity: 0 }}
+                              animate={{ height: 'auto', opacity: 1 }}
+                              exit={{ height: 0, opacity: 0 }}
+                              className="overflow-hidden space-y-3 mt-4"
+                            >
+                              {enviados2Orders.map(renderOrderCard)}
                             </motion.div>
                           )}
                         </AnimatePresence>
@@ -1927,10 +1995,12 @@ export default function MobileApp() {
 function StatusBadge({ status, onClick }) {
   const normalizedStatus = status ? (status.charAt(0).toUpperCase() + status.slice(1).toLowerCase()) : 'Pendiente'
   const colors = {
+    'Borrador': 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400',
     'Completado': 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
     'Pendiente': 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
     'Parcial': 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
     'Enviado': 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400',
+    'Enviados 2': 'bg-pink-100 text-pink-700 dark:bg-pink-900/30 dark:text-pink-400',
     'Cancelado': 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',
   }
   return (
@@ -1945,8 +2015,10 @@ function StatusBadge({ status, onClick }) {
 
 function StatusPickerDropdown({ currentStatus, onSelect, onClose }) {
   const ESTADOS = [
+    { label: 'Borrador',   color: 'text-orange-600 dark:text-orange-400', bg: 'hover:bg-orange-50 dark:hover:bg-orange-900/20' },
     { label: 'Pendiente',  color: 'text-amber-600  dark:text-amber-400',  bg: 'hover:bg-amber-50  dark:hover:bg-amber-900/20' },
     { label: 'Enviado',    color: 'text-purple-600 dark:text-purple-400', bg: 'hover:bg-purple-50 dark:hover:bg-purple-900/20' },
+    { label: 'Enviados 2', color: 'text-pink-600   dark:text-pink-400',   bg: 'hover:bg-pink-50   dark:hover:bg-pink-900/20' },
     { label: 'Parcial',   color: 'text-blue-600   dark:text-blue-400',   bg: 'hover:bg-blue-50   dark:hover:bg-blue-900/20' },
     { label: 'Completado', color: 'text-green-600  dark:text-green-400',  bg: 'hover:bg-green-50  dark:hover:bg-green-900/20' },
     { label: 'Cancelado',  color: 'text-red-600    dark:text-red-400',    bg: 'hover:bg-red-50    dark:hover:bg-red-900/20' },
