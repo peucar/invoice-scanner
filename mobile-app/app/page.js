@@ -1155,7 +1155,7 @@ export default function MobileApp() {
               className="ml-2 text-[10px] font-medium text-blue-500 bg-blue-500/10 hover:bg-blue-500/20 px-2 py-0.5 rounded-full border border-blue-500/20 shadow-sm active:scale-95 transition-all"
               title="Actualizar Aplicación"
             >
-              🔄 Actualizar v2.8 - Borradores
+              🔄 Actualizar v2.8.1 - Bug Dropdown
             </button>
           </h1>
         </div>
@@ -1400,10 +1400,10 @@ export default function MobileApp() {
                         <AnimatePresence>
                           {(showBorradores || search.trim().length > 0) && (
                             <motion.div
-                              initial={{ height: 0, opacity: 0 }}
-                              animate={{ height: 'auto', opacity: 1 }}
-                              exit={{ height: 0, opacity: 0 }}
-                              className="overflow-hidden space-y-3 mt-4"
+                              initial={{ height: 0, opacity: 0, overflow: 'hidden' }}
+                              animate={{ height: 'auto', opacity: 1, transitionEnd: { overflow: 'visible' } }}
+                              exit={{ height: 0, opacity: 0, overflow: 'hidden' }}
+                              className="space-y-3 mt-4"
                             >
                               {borradorOrders.map(renderOrderCard)}
                             </motion.div>
@@ -1432,10 +1432,10 @@ export default function MobileApp() {
                         <AnimatePresence>
                           {(showEnviados || search.trim().length > 0) && (
                             <motion.div
-                              initial={{ height: 0, opacity: 0 }}
-                              animate={{ height: 'auto', opacity: 1 }}
-                              exit={{ height: 0, opacity: 0 }}
-                              className="overflow-hidden space-y-3 mt-4"
+                              initial={{ height: 0, opacity: 0, overflow: 'hidden' }}
+                              animate={{ height: 'auto', opacity: 1, transitionEnd: { overflow: 'visible' } }}
+                              exit={{ height: 0, opacity: 0, overflow: 'hidden' }}
+                              className="space-y-3 mt-4"
                             >
                               {enviadosOrders.map(renderOrderCard)}
                             </motion.div>
@@ -1464,10 +1464,10 @@ export default function MobileApp() {
                         <AnimatePresence>
                           {(showEnviados2 || search.trim().length > 0) && (
                             <motion.div
-                              initial={{ height: 0, opacity: 0 }}
-                              animate={{ height: 'auto', opacity: 1 }}
-                              exit={{ height: 0, opacity: 0 }}
-                              className="overflow-hidden space-y-3 mt-4"
+                              initial={{ height: 0, opacity: 0, overflow: 'hidden' }}
+                              animate={{ height: 'auto', opacity: 1, transitionEnd: { overflow: 'visible' } }}
+                              exit={{ height: 0, opacity: 0, overflow: 'hidden' }}
+                              className="space-y-3 mt-4"
                             >
                               {enviados2Orders.map(renderOrderCard)}
                             </motion.div>
